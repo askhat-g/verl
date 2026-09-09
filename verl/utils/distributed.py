@@ -23,13 +23,16 @@ import ray
 import torch.distributed
 from torch.distributed import TCPStore
 
-from verl.utils.device import get_device_name, get_nccl_backend, get_resource_name, get_torch_device, is_npu_available
+from verl.utils.device import get_device_name, get_nccl_backend, get_resource_name, get_torch_device, is_cuda_available
 from verl.utils.net_utils import is_ipv6
 
 
 def set_numa_affinity():
-    if is_npu_available:
-        # TODO (FightingZhen) libnuma.so is not available in e2e_ascend CI image, remove this code after image update.
+    # The affinity below is applied through NVML, which only knows about NVIDIA devices. Every
+    # other accelerator backend has to return early instead of falling into the pynvml path, so
+    # gate on the accelerator rather than denylisting backends one at a time as they are added.
+    # ROCm keeps reporting through the CUDA device API, so its behaviour is unchanged.
+    if not is_cuda_available:
         return
 
     initialized = False

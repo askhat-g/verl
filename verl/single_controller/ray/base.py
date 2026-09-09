@@ -81,9 +81,14 @@ def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[Placement
     pg_ip = {}
     for pg in pgs:
         specs = ray._private.state.state.placement_group_table(pg.id)
-        # all bunles should be on the same node
-        node_id = specs["bundles_to_node_id"][0]
-        pg_ip[pg.id] = node_ip[node_id]
+        # All bundles should be on the same node, so any one of them identifies the placement
+        # group's node. Bundle indices are not guaranteed to start at 0, and the mapping is empty
+        # while a placement group is still pending, so take the lowest index that is present and
+        # fall back to a sentinel rather than raising KeyError -- this function only orders the
+        # groups, and an unplaced group has no address to order by yet.
+        bundles_to_node_id = specs.get("bundles_to_node_id") or {}
+        node_id = bundles_to_node_id.get(min(bundles_to_node_id)) if bundles_to_node_id else None
+        pg_ip[pg.id] = node_ip.get(node_id, "")
     return sorted(pgs, key=lambda pg: pg_ip[pg.id])
 
 
@@ -225,20 +230,22 @@ class ResourcePoolManager:
 
     def _check_resource_available(self):
         """Check if the resource pool can be satisfied in this ray cluster."""
+        # Ray advertises each accelerator under its own resource key ("GPU", "NPU", ...). Ask the
+        # active platform for that key instead of hardcoding the ones we happen to know about, so
+        # a backend that is neither of those reports its real shortfall here rather than counting
+        # zero devices and failing later inside placement group creation.
+        resource_name = get_platform().ray_resource_name()
         node_available_resources = ray._private.state.available_resources_per_node()
-        node_available_gpus = {
-            node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0)
-            for node, node_info in node_available_resources.items()
-        }
 
-        # check total required gpus can be satisfied
-        total_available_gpus = sum(node_available_gpus.values())
-        total_required_gpus = sum(
+        # check total required devices can be satisfied
+        total_available = sum(node_info.get(resource_name, 0) for node_info in node_available_resources.values())
+        total_required = sum(
             [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
         )
-        if total_available_gpus < total_required_gpus:
+        if total_available < total_required:
             raise ValueError(
-                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
+                f"Total available {resource_name} {total_available} is less than "
+                f"total desired {resource_name} {total_required}"
             )
 
 
