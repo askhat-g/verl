@@ -81,9 +81,11 @@ def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[Placement
     pg_ip = {}
     for pg in pgs:
         specs = ray._private.state.state.placement_group_table(pg.id)
-        # all bunles should be on the same node
-        node_id = specs["bundles_to_node_id"][0]
-        pg_ip[pg.id] = node_ip[node_id]
+        # All bundles are on the same node, so any one identifies the group. Indices need not
+        # start at 0, and the mapping is empty while a group is pending -- both were KeyError.
+        bundles_to_node_id = specs.get("bundles_to_node_id") or {}
+        node_id = bundles_to_node_id.get(min(bundles_to_node_id)) if bundles_to_node_id else None
+        pg_ip[pg.id] = node_ip.get(node_id, "")
     return sorted(pgs, key=lambda pg: pg_ip[pg.id])
 
 
@@ -225,20 +227,19 @@ class ResourcePoolManager:
 
     def _check_resource_available(self):
         """Check if the resource pool can be satisfied in this ray cluster."""
+        # accelerator resource key differs per platform ("GPU", "NPU", ...)
+        resource_name = get_platform().ray_resource_name()
         node_available_resources = ray._private.state.available_resources_per_node()
-        node_available_gpus = {
-            node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0)
-            for node, node_info in node_available_resources.items()
-        }
 
-        # check total required gpus can be satisfied
-        total_available_gpus = sum(node_available_gpus.values())
-        total_required_gpus = sum(
+        # check total required devices can be satisfied
+        total_available = sum(node_info.get(resource_name, 0) for node_info in node_available_resources.values())
+        total_required = sum(
             [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
         )
-        if total_available_gpus < total_required_gpus:
+        if total_available < total_required:
             raise ValueError(
-                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
+                f"Total available {resource_name} {total_available} is less than "
+                f"total desired {resource_name} {total_required}"
             )
 
 
