@@ -13,23 +13,29 @@
 # limitations under the License.
 """Resource discovery must not assume a specific accelerator vendor.
 
-These tests pin down behaviour that is easy to regress by hardcoding ``"GPU"``/``"NPU"``
-or by assuming a bundle layout Ray does not guarantee. They run without a Ray cluster
-and without an accelerator: the Ray state APIs and the active platform are stubbed out.
+These tests pin down behaviour that is easy to regress by hardcoding ``"GPU"``/``"NPU"``,
+by assuming a bundle layout Ray does not guarantee, or by assuming NVML is present. They
+run without a Ray cluster and without an accelerator: the Ray state APIs and the active
+platform are stubbed out.
 """
 
 import pytest
 import ray
 
-from verl.single_controller.ray.base import ResourcePoolManager, sort_placement_group_by_node_ip
+import verl.utils.distributed as distributed_utils
+from verl.single_controller.ray.base import RayResourcePool, ResourcePoolManager, sort_placement_group_by_node_ip
 
 
 class _FakePlatform:
-    def __init__(self, resource_name):
+    def __init__(self, resource_name, colocation=True):
         self._resource_name = resource_name
+        self._colocation = colocation
 
     def ray_resource_name(self):
         return self._resource_name
+
+    def supports_colocated_worker_groups(self):
+        return self._colocation
 
 
 class _FakePG:
@@ -160,3 +166,86 @@ def test_check_resource_available_ignores_other_vendors_resources(monkeypatch):
 
     with pytest.raises(ValueError, match="TPU"):
         _manager([8])._check_resource_available()
+
+
+# ---------------------------------------------------------------------------
+# Colocation cap
+# ---------------------------------------------------------------------------
+
+
+def _use_platform(monkeypatch, platform):
+    monkeypatch.setattr("verl.single_controller.ray.base.get_platform", lambda: platform)
+
+
+def test_resource_pool_keeps_colocate_count_where_devices_are_shareable(monkeypatch):
+    """Existing accelerators time-share, so the requested colocation must be preserved."""
+    _use_platform(monkeypatch, _FakePlatform("GPU", colocation=True))
+
+    assert RayResourcePool([4], max_colocate_count=3).max_colocate_count == 3
+
+
+def test_resource_pool_caps_colocate_count_where_devices_are_exclusive(monkeypatch):
+    """A device claimed by a single process cannot host several WorkerGroups."""
+    _use_platform(monkeypatch, _FakePlatform("TPU", colocation=False))
+
+    # Left at 3 this builds a placement group asking for 3 CPUs per exclusive chip,
+    # which never becomes schedulable.
+    assert RayResourcePool([4], max_colocate_count=3).max_colocate_count == 1
+
+
+@pytest.mark.parametrize("colocation,expected", [(True, 3), (False, 1)])
+def test_resource_pool_manager_matches_the_pool_it_creates(monkeypatch, colocation, expected):
+    """The manager sizes bundles, so its cap has to agree with RayResourcePool's."""
+    _use_platform(monkeypatch, _FakePlatform("GPU" if colocation else "TPU", colocation=colocation))
+
+    manager = ResourcePoolManager(resource_pool_spec={"pool": [4]}, mapping={}, max_colocate_count=3)
+
+    assert manager.max_colocate_count == expected
+
+
+# ---------------------------------------------------------------------------
+# set_numa_affinity
+# ---------------------------------------------------------------------------
+
+
+def test_set_numa_affinity_skips_on_tpu(monkeypatch):
+    """NUMA pinning goes through NVML, which has no TPU equivalent."""
+    monkeypatch.setattr(distributed_utils, "is_npu_available", False)
+    monkeypatch.setattr(distributed_utils, "is_tpu_available", True)
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("libnuma/NVML must not be touched on TPU")
+
+    monkeypatch.setattr(distributed_utils.ctypes, "CDLL", _fail)
+
+    distributed_utils.set_numa_affinity()  # must be a no-op, not an error
+
+
+def test_set_numa_affinity_skips_on_npu(monkeypatch):
+    """The pre-existing NPU early return must survive the TPU addition."""
+    monkeypatch.setattr(distributed_utils, "is_npu_available", True)
+    monkeypatch.setattr(distributed_utils, "is_tpu_available", False)
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("libnuma/NVML must not be touched on NPU")
+
+    monkeypatch.setattr(distributed_utils.ctypes, "CDLL", _fail)
+
+    distributed_utils.set_numa_affinity()  # must be a no-op, not an error
+
+
+def test_set_numa_affinity_attempts_setup_on_gpu(monkeypatch):
+    """On GPU the NVML path is still entered (and failures stay non-fatal)."""
+    monkeypatch.setattr(distributed_utils, "is_npu_available", False)
+    monkeypatch.setattr(distributed_utils, "is_tpu_available", False)
+    calls = []
+
+    def _record(name):
+        calls.append(name)
+        raise OSError("libnuma.so not present in this test environment")
+
+    monkeypatch.setattr(distributed_utils.ctypes, "CDLL", _record)
+
+    distributed_utils.set_numa_affinity()  # swallows the failure
+
+    assert calls == ["libnuma.so"]
