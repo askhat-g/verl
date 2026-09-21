@@ -71,10 +71,10 @@ permissions:
 jobs:
   e2e_sft_llm_ascend:
     if: github.repository_owner == 'verl-project'
-    runs-on: linux-aarch64-a2b3-8
+    runs-on: linux-aarch64-a3-800i-8
     timeout-minutes: 90 # Increase this timeout value as needed
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/ascend-ci/verl/verl:latest-vllm-910b-ubuntu
+      image: swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/ascend-ci/verl/verl:latest-vllm-a3-ubuntu
       options: >-
         --shm-size 16g
     env:
@@ -99,12 +99,16 @@ jobs:
           pip install --no-deps -e .
           pip install veomni==0.1.11 --ignore-requires-python --no-deps --index-url https://pypi.org/simple/
           pip install pandas==2.3.3
+          # transformers 5.10.x in the image dropped the cache_position kwarg of
+          # create_causal_mask, breaking veomni 0.1.11's patched qwen2 model; pin back to
+          # the version vllm-ascend in the same image requires.
+          pip install "transformers==5.5.4"
       - name: Check final pip list
         run: |
           pip list
       - name: Prepare weights
         run: |
-          ln -s /root/.cache/models ~/models
+          ln -s /root/.cache/modelscope/hub/models ~/models
       - name: Prepare gsm8k dataset
         run: |
           python3 examples/data_preprocess/gsm8k_multiturn_sft.py --local_dataset_path ${HOME}/.cache/datasets/openai/gsm8k
