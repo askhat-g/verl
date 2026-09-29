@@ -27,8 +27,8 @@ from verl.workers.utils.padding import no_padding_2_padding
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
-    dp_size = data["dp_size"]
-    batch_num_tokens = data["batch_num_tokens"]
+    dp_size = tu.get_non_tensor_data(data=data, key="dp_size", default=1)
+    batch_num_tokens = tu.get_non_tensor_data(data=data, key="batch_num_tokens", default=None)
 
     log_prob = model_output["log_probs"]
 
@@ -37,11 +37,20 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         # for each sample, loss mask shape is [1, prompt_length + response_length]
         loss_mask = data["loss_mask"]
 
-        log_prob_flatten = log_prob.values()
+        log_prob_flatten = getattr(log_prob, "_tpu_padded_values", None)
+        if log_prob_flatten is None:
+            log_prob_flatten = log_prob.values()
         loss_mask_flatten = loss_mask.values()
 
         # left-shift the loss mask by one token to align with log_prob
         loss_mask_flatten = torch.roll(loss_mask_flatten, shifts=-1, dims=0)
+        if loss_mask_flatten.shape[0] < log_prob_flatten.shape[0]:
+            pad_len = log_prob_flatten.shape[0] - loss_mask_flatten.shape[0]
+            loss_mask_flatten = torch.nn.functional.pad(loss_mask_flatten, (0, pad_len), value=0)
+        if loss_mask_flatten.device != log_prob_flatten.device:
+            loss_mask_flatten = loss_mask_flatten.to(log_prob_flatten.device)
+        if batch_num_tokens is None:
+            batch_num_tokens = loss_mask_flatten.to(log_prob_flatten.dtype).sum()
 
         # NOTE: loss is averaged over all tokens in the batch across all data parallel groups,
         # For FSDP backend, the loss is directly used for backward; while for Megatron backend,
@@ -49,6 +58,10 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         loss = -masked_sum(log_prob_flatten, loss_mask_flatten) / batch_num_tokens * dp_size
     else:
         response_mask = data["response_mask"].to(bool)
+        if response_mask.device != log_prob.device:
+            response_mask = response_mask.to(log_prob.device)
+        if batch_num_tokens is None:
+            batch_num_tokens = response_mask.to(log_prob.dtype).sum()
         loss = -masked_sum(log_prob, response_mask) / batch_num_tokens * dp_size
 
     return loss, {}

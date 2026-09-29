@@ -131,6 +131,8 @@ class RayResourcePool(ResourcePool):
         self.pgs = None
         self.detached = detached
         self.accelerator_type = accelerator_type
+        if self.accelerator_type is None and get_platform().device_name == "tpu":
+            self.accelerator_type = get_platform().auto_assign_accelerator_type(self.name_prefix, self.accelerator_type)
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
         if self.pgs is not None:
@@ -152,6 +154,10 @@ class RayResourcePool(ResourcePool):
             bundle[device_name] = 1
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4
+        if current_platform.device_name == "tpu":
+            current_platform.configure_placement_group_bundle(
+                bundle, self.use_gpu, device_name, self.name_prefix, self.accelerator_type
+            )
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
 
         lifetime = "detached" if self.detached else None

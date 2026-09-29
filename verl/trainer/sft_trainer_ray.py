@@ -32,6 +32,7 @@ from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
+from verl.plugin.platform import get_platform
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint import CheckpointHandler, OrchestrationMode
 from verl.utils.dataset.dataset_utils import SFTTensorCollator
@@ -344,7 +345,7 @@ class SFTTrainer:
                 metrics["train/grad_norm"] = metrics.pop("grad_norm")
                 metrics["train/lr"] = metrics.pop("lr")
                 metrics["train/mfu"] = metrics.pop("mfu")
-                metrics["train/global_tokens"] = torch.sum(torch.tensor(batch_seqlens, device=self.device_name)).item()
+                metrics["train/global_tokens"] = sum(batch_seqlens)
                 total_tokens += metrics["train/global_tokens"]
                 metrics["train/total_tokens(B)"] = total_tokens / 1e9
                 tracking.log(data=metrics, step=global_step)
@@ -362,9 +363,12 @@ class SFTTrainer:
                         output = self.training_client.infer_batch(val_data)
                         output = output.get()
                         metrics = tu.get(output, "metrics")
-                        val_losses.append(metrics["loss"])
+                        if isinstance(metrics, list):
+                            val_losses.append(sum(m["loss"] for m in metrics) / len(metrics))
+                        else:
+                            val_losses.append(metrics["loss"])
 
-                    val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
+                    val_loss = torch.mean(torch.tensor(val_losses, dtype=torch.float32))
 
                     metric = {"val/loss": val_loss.detach().item()}
                     tracking.log(data=metric, step=global_step)
@@ -380,7 +384,8 @@ class SFTTrainer:
 
 
 def run_sft(config):
-    ray.init()
+    ray_init_kwargs = get_platform().get_ray_init_kwargs() if hasattr(get_platform(), "get_ray_init_kwargs") else {}
+    ray.init(**ray_init_kwargs)
     trainer = SFTTrainer(config=config)
     trainer.fit()
 

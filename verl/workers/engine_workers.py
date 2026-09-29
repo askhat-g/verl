@@ -192,10 +192,16 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # perform all gather in dp group to ensure that it's correct.
         # Here each metric in metrics can be a list (micro-batch metrics) or a singleton
         # we should always sum the loss of each micro-batch as we scale by global_bsz/global_token
-        loss = torch.sum(torch.tensor(output.pop("loss"), device=self.device_name))
         dp_group = self.engine.get_data_parallel_group()
-        if dp_group is not None:
-            torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_group)
+        if self.device_name == "tpu":
+            loss = torch.sum(torch.tensor(output.pop("loss"), dtype=torch.float32, device="cpu"))
+            if dp_group is not None and torch.distributed.get_world_size() == self.engine.get_data_parallel_size():
+                torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM)
+                loss /= torch.distributed.get_world_size()
+        else:
+            loss = torch.sum(torch.tensor(output.pop("loss"), device=self.device_name))
+            if dp_group is not None:
+                torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_group)
         loss = loss.item()
 
         # For grad_norm, we do not perform all reduce because it is already been done when clipping grad
@@ -205,7 +211,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         lr = metrics.pop("lr", None)
 
         # For other metrics, we perform all gather in dp group (only if DP > 1)
-        if dp_group is not None:
+        if dp_group is not None and metrics:
             final_metrics = allgather_dict_into_dict(data=metrics, group=dp_group)
         else:
             final_metrics = metrics
