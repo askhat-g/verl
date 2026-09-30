@@ -1,0 +1,295 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ray-ksa
+  namespace: default
+  annotations:
+    iam.gke.io/gcp-service-account: ray-tpu-gsa@tpu-pytorch.iam.gserviceaccount.com
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ray-ksa-admin-binding
+subjects:
+- kind: ServiceAccount
+  name: ray-ksa
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: verl-tpu-bootstrap
+  namespace: default
+data:
+  bootstrap.py: |
+    import os, shutil, subprocess
+    from pathlib import Path
+    import ray
+
+    repo_id = os.environ.get("TARGET_MODEL_ID", "Qwen/Qwen3-32B")
+    model_name = repo_id.split("/")[-1]
+    vfio = Path("/dev/vfio")
+    is_tpu_node = vfio.is_dir() and any(p.name.isdigit() for p in vfio.iterdir())
+
+    # 1. Apply ray-project/ray#66400 and PyTorch FSDP2 finalize_backward fix
+    site_packages = Path(ray.__file__).resolve().parent
+    worker_path = site_packages / "_private" / "worker.py"
+    old_w = '''        if self.original_visible_accelerator_ids.get(resource_name, None) is not None:
+            original_ids = self.original_visible_accelerator_ids[resource_name]
+            assigned_ids = {str(original_ids[i]) for i in assigned_ids}
+        return list(assigned_ids)'''
+    new_w = '''        if self.original_visible_accelerator_ids.get(resource_name, None) is not None:
+            original_ids = self.original_visible_accelerator_ids[resource_name]
+            if all(i < len(original_ids) for i in assigned_ids):
+                assigned_ids = {str(original_ids[i]) for i in assigned_ids}
+            else:
+                assigned_ids = {str(x) for x in original_ids[: len(assigned_ids)]}
+        return list(assigned_ids)'''
+    w_txt = worker_path.read_text()
+    if old_w in w_txt:
+        worker_path.write_text(w_txt.replace(old_w, new_w, 1))
+
+    import torch
+    fsdp_pg_path = Path(torch.__file__).resolve().parent / "distributed" / "fsdp" / "_fully_shard" / "_fsdp_param_group.py"
+    if fsdp_pg_path.is_file():
+        pg_txt = fsdp_pg_path.read_text()
+        bad_line = "torch.accelerator.current_stream().wait_event(event)"
+        good_line = "self.device_handle.current_stream().wait_event(event)"
+        if bad_line in pg_txt:
+            fsdp_pg_path.write_text(pg_txt.replace(bad_line, good_line))
+    (site_packages.parent / "verl.pth").write_text("/workspace/verl\n/data/verl\n")
+
+    # 2. Evict other models so checkpoints never stack up on disk
+    hf_root = Path("/data/jialei/assets/hf")
+    gsm8k_dir = Path("/data/jialei/data/gsm8k")
+    hf_root.mkdir(parents=True, exist_ok=True)
+    gsm8k_dir.mkdir(parents=True, exist_ok=True)
+    for base in (hf_root, Path("/tmp/models")):
+        if base.is_dir():
+            for child in list(base.iterdir()):
+                if child.name != model_name:
+                    shutil.rmtree(child, ignore_errors=True)
+    shutil.rmtree("/tmp/verl_weight_cache", ignore_errors=True)
+    shutil.rmtree("/tmp/hf_cache", ignore_errors=True)
+
+    # 3. Download target model if not already complete (skip .safetensors on CPU head pod)
+    target_dir = hf_root / model_name
+    if not (target_dir / "config.json").is_file():
+        from huggingface_hub import snapshot_download
+        ignore_pats = None if is_tpu_node else ["*.safetensors", "*.bin", "*.pt"]
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=str(target_dir),
+            local_dir_use_symlinks=False,
+            cache_dir=str(target_dir / ".cache"),
+            ignore_patterns=ignore_pats,
+            max_workers=4,
+        )
+        shutil.rmtree(target_dir / ".cache", ignore_errors=True)
+
+    # 4. Prepare GSM8K parquet files if missing
+    if not (gsm8k_dir / "train.parquet").is_file() or not (gsm8k_dir / "test.parquet").is_file():
+        import datasets
+        ds = datasets.load_dataset("openai/gsm8k", "main")
+        inst = 'Let\'s think step by step and output the final answer after "####".'
+        def make_map_fn(split):
+            def fn(ex, idx):
+                q = ex.pop("question")
+                a = ex.pop("answer")
+                return {
+                    "data_source": "openai/gsm8k",
+                    "prompt": [{"role": "user", "content": q + " " + inst}],
+                    "ability": "math",
+                    "reward_model": {"style": "rule", "ground_truth": a.split("#### ")[-1].replace(",", "")},
+                    "extra_info": {"split": split, "index": idx, "answer": a, "question": q},
+                }
+            return fn
+        ds["train"].map(make_map_fn("train"), with_indices=True).to_parquet(str(gsm8k_dir / "train.parquet"))
+        ds["test"].map(make_map_fn("test"), with_indices=True).to_parquet(str(gsm8k_dir / "test.parquet"))
+---
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ray-tpu-v6e-cluster
+  namespace: default
+spec:
+  headGroupSpec:
+    rayStartParams: {}
+    template:
+      spec:
+        serviceAccountName: ray-ksa
+        containers:
+          - name: ray-head
+            image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260930-grpo32b
+            imagePullPolicy: Always
+            env:
+              - name: RAY_TRAIN_V2_ENABLED
+                value: "1"
+              - name: TARGET_MODEL_ID
+                value: "Qwen/Qwen3-32B"
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: hf-secret
+                    key: hf_token
+                    optional: true
+            lifecycle:
+              postStart:
+                exec:
+                  command: ["bash", "-c", "mkdir -p /workspace && ln -sfn /data/verl /workspace/verl && nohup python3 /etc/verl-bootstrap/bootstrap.py >/tmp/bootstrap.log 2>&1 &"]
+            ports:
+              - containerPort: 8265
+              - containerPort: 10001
+              - containerPort: 8888
+              - containerPort: 8000
+            resources:
+              limits:
+                cpu: "12"
+                memory: "48Gi"
+              requests:
+                cpu: "12"
+                memory: "48Gi"
+            volumeMounts:
+              - name: host-data
+                mountPath: /data
+              - name: host-tmp
+                mountPath: /tmp
+              - name: bootstrap-cm
+                mountPath: /etc/verl-bootstrap
+        volumes:
+          - name: host-data
+            hostPath:
+              path: /var/data
+              type: DirectoryOrCreate
+          - name: host-tmp
+            hostPath:
+              path: /tmp
+          - name: bootstrap-cm
+            configMap:
+              name: verl-tpu-bootstrap
+  workerGroupSpecs:
+    # 1. Trainer Slice: 4x4 (16 TPU v6e chips across 4 hosts on xibin-v6e-8-4-np-2)
+    - replicas: 1
+      numOfHosts: 4
+      groupName: tpu-group-trainer
+      rayStartParams: {}
+      template:
+        spec:
+          serviceAccountName: ray-ksa
+          containers:
+            - name: ray-worker
+              image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260930-grpo32b
+              imagePullPolicy: Always
+              resources:
+                limits:
+                  memory: "400Gi"
+                  google.com/tpu: "4"
+                requests:
+                  cpu: "48"
+                  memory: "400Gi"
+                  google.com/tpu: "4"
+              env:
+                - name: RAY_TRAIN_V2_ENABLED
+                  value: "1"
+                - name: RAY_memory_monitor_refresh_ms
+                  value: "0"
+                - name: RAY_memory_usage_threshold
+                  value: "0.99"
+                - name: TARGET_MODEL_ID
+                  value: "Qwen/Qwen3-32B"
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-secret
+                      key: hf_token
+                      optional: true
+              lifecycle:
+                postStart:
+                  exec:
+                    command: ["bash", "-c", "mkdir -p /workspace && ln -sfn /data/verl /workspace/verl && nohup python3 /etc/verl-bootstrap/bootstrap.py >/tmp/bootstrap.log 2>&1 &"]
+              volumeMounts:
+                - name: host-data
+                  mountPath: /data
+                - name: host-tmp
+                  mountPath: /tmp
+                - name: bootstrap-cm
+                  mountPath: /etc/verl-bootstrap
+          volumes:
+            - name: host-data
+              hostPath:
+                path: /var/data
+                type: DirectoryOrCreate
+            - name: host-tmp
+              hostPath:
+                path: /tmp
+            - name: bootstrap-cm
+              configMap:
+                name: verl-tpu-bootstrap
+          nodeSelector:
+            cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+            cloud.google.com/gke-tpu-topology: 4x4
+    # 2. Rollout Slice: 2x4 (8 TPU v6e chips across 2 hosts on xibin-v6e-8-2-np-1)
+    - replicas: 1
+      numOfHosts: 2
+      groupName: tpu-group
+      rayStartParams: {}
+      template:
+        spec:
+          serviceAccountName: ray-ksa
+          containers:
+            - name: ray-worker
+              image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260930-grpo32b
+              imagePullPolicy: Always
+              resources:
+                limits:
+                  memory: "400Gi"
+                  google.com/tpu: "4"
+                requests:
+                  cpu: "48"
+                  memory: "400Gi"
+                  google.com/tpu: "4"
+              env:
+                - name: RAY_TRAIN_V2_ENABLED
+                  value: "1"
+                - name: RAY_memory_monitor_refresh_ms
+                  value: "0"
+                - name: RAY_memory_usage_threshold
+                  value: "0.99"
+                - name: TARGET_MODEL_ID
+                  value: "Qwen/Qwen3-32B"
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-secret
+                      key: hf_token
+                      optional: true
+              lifecycle:
+                postStart:
+                  exec:
+                    command: ["bash", "-c", "mkdir -p /workspace && ln -sfn /data/verl /workspace/verl && nohup python3 /etc/verl-bootstrap/bootstrap.py >/tmp/bootstrap.log 2>&1 &"]
+              volumeMounts:
+                - name: host-data
+                  mountPath: /data
+                - name: host-tmp
+                  mountPath: /tmp
+                - name: bootstrap-cm
+                  mountPath: /etc/verl-bootstrap
+          volumes:
+            - name: host-data
+              hostPath:
+                path: /var/data
+                type: DirectoryOrCreate
+            - name: host-tmp
+              hostPath:
+                path: /tmp
+            - name: bootstrap-cm
+              configMap:
+                name: verl-tpu-bootstrap
+          nodeSelector:
+            cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+            cloud.google.com/gke-tpu-topology: 2x4

@@ -78,18 +78,30 @@ def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[Placement
     With this function, if there's only one resource pool and there's no node change, RANK should be consistent
     across nodes in multiple ray jobs, even if the whole ray cluster is restarted.
     """
-    node_ip = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes()}
-    pg_ip = {}
+    # (a) Why needed: On GKE TPU multi-host slices, libtpu assigns physical host IDs (0..3) in order of
+    #     the GKE node hostname (...-node-0..3), whereas dynamic pod/node IPs (e.g. 10.204.3.7, 10.204.15.7)
+    #     sort lexicographically out of order ('10.204.15.7' < '10.204.3.7'). Sorting by
+    #     (NodeManagerHostname, NodeManagerAddress) aligns verl worker ranks with libtpu host ranks.
+    # (b) Strictly necessary or cluster-configurable?: Strictly necessary in code for 4+ host TPU slices
+    #     (v6e-16, v6e-32); GKE IPAM cannot be configured to assign IP strings that sort ASCII-lexicographically
+    #     in node-index order.
+    # (c) Why smaller models (0.6B, 4B) didn't require it: 0.6B and 4B ran on 2-host v6e-8 slices where
+    #     a 2-host ring is symmetric.
+    node_key = {
+        node["NodeID"]: (node.get("NodeManagerHostname", ""), node.get("NodeManagerAddress", ""))
+        for node in ray.nodes()
+    }
+    pg_key = {}
     for pg in pgs:
         specs = ray._private.state.state.placement_group_table(pg.id)
         bundles_map = specs.get("bundles_to_node_id", {})
         if bundles_map:
             min_b_idx = min(bundles_map.keys())
             node_id = bundles_map[min_b_idx]
-            pg_ip[pg.id] = node_ip.get(node_id, "")
+            pg_key[pg.id] = node_key.get(node_id, ("", ""))
         else:
-            pg_ip[pg.id] = ""
-    return sorted(pgs, key=lambda pg: pg_ip[pg.id])
+            pg_key[pg.id] = ("", "")
+    return sorted(pgs, key=lambda pg: pg_key[pg.id])
 
 
 @ray.remote
@@ -134,7 +146,11 @@ class RayResourcePool(ResourcePool):
         self.pgs = None
         self.detached = detached
         if accelerator_type is None and get_platform().device_name == "tpu":
-            accelerator_type = get_platform().auto_assign_accelerator_type(self.name_prefix, accelerator_type)
+            # Pass num_nodes=len(self._store) so heterogeneous multi-slice clusters (e.g. 4-node v6e-16
+            # trainer + 2-node v6e-8 rollout) match the slice with the exact node count.
+            accelerator_type = get_platform().auto_assign_accelerator_type(
+                self.name_prefix, accelerator_type, num_nodes=len(self._store)
+            )
         self.accelerator_type = accelerator_type
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):

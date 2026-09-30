@@ -11,8 +11,16 @@ The training setup uses:
 
 ## 🚀 Quick Start on GKE TPU Cluster
 
-### 1. Prerequisites
-Ensure you have a running KubeRay cluster on GKE TPU v6e nodes (deployed via [`examples/tpu/gke/ray-tpu-v6e8-2slice.yaml`](../gke/ray-tpu-v6e8-2slice.yaml)) with the GCS bucket mounted at `/data` inside the pods.
+### 1. Provision or Update Your GKE KubeRay Cluster
+
+Deploy the KubeRay `RayCluster` on GKE TPU v6e nodes using either the GCS Fuse manifest ([`examples/tpu/gke/ray-tpu-v6e8-2slice.yaml`](../gke/ray-tpu-v6e8-2slice.yaml)) or the self-contained HostPath manifest ([`examples/tpu/gke/model_0_6b_config.yaml`](../gke/model_0_6b_config.yaml)); see [`examples/tpu/gke/README.md`](../gke/README.md) for full node-pool creation and cluster management instructions:
+
+```bash
+# Deploy the RayCluster (1 CPU head pod + 2 x v6e-8 TPU worker slices)
+kubectl apply -f examples/tpu/gke/ray-tpu-v6e8-2slice.yaml
+# or for node-local /var/data storage with automatic checkpoint download:
+kubectl apply -f examples/tpu/gke/model_0_6b_config.yaml
+```
 
 Default paths inside the GKE cluster (`/data/jialei`):
 - `MODEL_PATH`: `/data/jialei/assets/hf/Qwen3-0.6B`

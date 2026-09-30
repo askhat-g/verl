@@ -27,7 +27,7 @@ import torch
 
 from .platform_cuda import PlatformCUDA
 from .platform_manager import PlatformRegistry, get_platform
-from .platform_tpu_workarounds import convert_tensors_to_scalars, patch_ray_worker
+from .platform_tpu_workarounds import convert_tensors_to_scalars
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -47,12 +47,21 @@ TPU_HBM_BYTES_MAP = {
     "v7x": HBM_BYTES_TPU_V7X,
 }
 
-# TPU default 3D mesh topology mappings by pod type or total chips
+# TPU default 3D mesh topology mappings by pod type or total chips.
+# (a) Why needed: Added "v6e-16": "4,4,1" and 16: "4,4,1" so 16-chip TPU slices get a 4x4 2D torus
+#     instead of falling back to "1,1,1" (which fails libtpu PJRT initialization).
+# (b) Strictly necessary or cluster-configurable?: Necessary in code as long as get_distributed_env_vars
+#     sets TORCH_TPU_TOPOLOGY. If PlatformTPU deferred to the GKE TPU webhook env vars for full-slice
+#     workloads, GKE would inject the slice topology automatically.
+# (c) Why smaller models (0.6B, 4B) didn't require it: They ran on 8-chip v6e-8 slices ("2,4,1"),
+#     which were already in TPU_TOPOLOGY_MAP. 32B uses a 16-chip v6e-16 trainer slice.
 TPU_TOPOLOGY_MAP = {
     "v6e-32": "4,8,1",
+    "v6e-16": "4,4,1",
     "v6e-8": "2,4,1",
     "v6e-4": "2,2,1",
     32: "4,8,1",
+    16: "4,4,1",
     8: "2,4,1",
     4: "2,2,1",
 }
@@ -361,11 +370,20 @@ class PlatformTPU(PlatformCUDA):
             "TPU_VISIBLE_CHIPS": str(local_rank),
         }
 
-        # Apply TPU topology and host bounds based on TPU pod type or world size
+        # Apply TPU topology and host bounds based on world size or local node TPU pod type.
+        # (a) Why needed: Previously, tpu_nodes[0] could inspect a v6e-8 rollout node while initializing
+        #     a v6e-16 trainer worker, assigning a "2,4,1" (8-chip) topology to a 16-chip trainer group.
+        #     Resolving by world_size / local_ip ensures v6e-16 trainer workers get "4,4,1".
+        # (b) Strictly necessary or cluster-configurable?: Necessary in code whenever heterogeneous TPU slices
+        #     (e.g. v6e-16 + v6e-8) share a Ray cluster and PlatformTPU sets TORCH_TPU_TOPOLOGY.
+        # (c) Why smaller models (0.6B, 4B) didn't require it: Smaller models used homogeneous clusters where
+        #     every TPU node was v6e-8 (world_size=8).
         tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
-        tpu_type = tpu_nodes[0].get("Labels", {}).get("ray.io/tpu-pod-type", "") if tpu_nodes else ""
+        local_tpu_nodes = [n for n in tpu_nodes if n.get("NodeManagerAddress") == local_ip]
+        target_node = local_tpu_nodes[0] if local_tpu_nodes else (tpu_nodes[0] if tpu_nodes else {})
+        tpu_type = target_node.get("Labels", {}).get("ray.io/tpu-pod-type", "")
 
-        topo = TPU_TOPOLOGY_MAP.get(tpu_type, TPU_TOPOLOGY_MAP.get(world_size, "1,1,1"))
+        topo = TPU_TOPOLOGY_MAP.get(world_size, TPU_TOPOLOGY_MAP.get(tpu_type, "1,1,1"))
 
         env_vars.update(
             {
@@ -388,22 +406,44 @@ class PlatformTPU(PlatformCUDA):
 
         return env_vars
 
-    def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
+    def auto_assign_accelerator_type(
+        self, name_prefix: str, accelerator_type: Optional[str], num_nodes: Optional[int] = None
+    ) -> Optional[str]:
         """Dynamically assign a TPU slice/group affinity to a resource pool on multi-slice clusters."""
         if accelerator_type is not None:
             return accelerator_type
 
+        # (a) Why needed: Matches each RayResourcePool (num_nodes) to the tpu-group-* resource with the
+        #     exact number of alive nodes (4 nodes for v6e-16 trainer, 2 nodes for v6e-8 rollout) instead
+        #     of relying only on alphabetical sorting of slice names.
+        # (b) Strictly necessary or cluster-configurable?: Can be avoided via cluster/YAML naming if the
+        #     trainer worker group name always sorts alphabetically before the rollout group name (or if
+        #     accelerator_type is passed explicitly), but matching by num_nodes prevents misplacement.
+        # (c) Why smaller models (0.6B, 4B) didn't require it: Smaller models used two identical 2-node
+        #     v6e-8 slices, so both slices had the same node count and were interchangeable.
         try:
             if ray.is_initialized():
-                tpu_slices = set()
+                slice_counts: dict[str, int] = {}
                 for node in ray.nodes():
                     if node.get("Alive"):
                         for res in node.get("Resources", {}).keys():
                             if res.startswith("tpu-group-"):
-                                tpu_slices.add(res)
-                tpu_slices = sorted(list(tpu_slices))
+                                slice_counts[res] = slice_counts.get(res, 0) + 1
+                is_rollout = any(k in name_prefix.lower() for k in ["rollout", "reward", "teacher"])
+                target_nodes = num_nodes or int(
+                    os.environ.get("NNODES_ROLLOUT" if is_rollout else "NNODES_TRAINER", "2")
+                )
+                exact_slices = sorted([s for s, c in slice_counts.items() if c == target_nodes])
+                if exact_slices:
+                    if len(exact_slices) >= 2 and is_rollout:
+                        return exact_slices[1]
+                    return exact_slices[0]
+                # Fallback: sort by closest node count
+                tpu_slices = [
+                    s for s, _ in sorted(slice_counts.items(), key=lambda kv: (abs(kv[1] - target_nodes), kv[0]))
+                ]
                 if len(tpu_slices) >= 1:
-                    if len(tpu_slices) >= 2 and any(k in name_prefix.lower() for k in ["rollout", "reward", "teacher"]):
+                    if len(tpu_slices) >= 2 and is_rollout:
                         return tpu_slices[1]
                     return tpu_slices[0]
         except Exception:
@@ -467,9 +507,17 @@ class PlatformTPU(PlatformCUDA):
 
     def get_ray_init_kwargs(self) -> dict[str, Any]:
         """Return Ray initialization arguments with runtime_env configured for GKE TPU workers."""
+        # (a) Why we removed "worker_process_setup_hook": patch_ray_worker:
+        #     When vLLM V1 (TP=8 across 2 hosts) spawns EngineCore in a subprocess and uses
+        #     RayDistributedExecutor to launch RayWorkerWrapper actors, inheriting worker_process_setup_hook
+        #     in runtime_env causes actor startup to fail. On ray==2.53.0+, the old IndexError patch is
+        #     no longer needed.
+        # (b) Strictly necessary or cluster-configurable?: Strictly necessary in code for multi-host vLLM
+        #     (TP=8) with RayDistributedExecutor.
+        # (c) Why smaller models (0.6B, 4B) didn't require it: 0.6B (TP=1) and 4B (TP=2/4) fit on a single
+        #     4-chip TPU host (uni/mp executor) and never spawn cross-node RayWorkerWrapper actors.
         return {
             "runtime_env": {
-                "worker_process_setup_hook": patch_ray_worker,
                 "env_vars": {"VERL_PLATFORM": "tpu"},
             }
         }

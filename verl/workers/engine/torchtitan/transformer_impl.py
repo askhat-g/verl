@@ -218,6 +218,16 @@ class TorchTitanEngine(BaseEngine):
         training_kwargs = {}
         if self.engine_config.max_seq_len is not None:
             training_kwargs["seq_len"] = self.engine_config.max_seq_len
+        # (a) Why needed: Without forwarding dtype="bfloat16", TorchTitan's TrainingConfig defaults to
+        #     float32, causing FSDP2 MixedPrecisionPolicy to allocate fp32 all-gather and reduce-scatter
+        #     buffers (2x HBM, ~11.6 GB instead of ~5.8 GB per layer group), triggering TPU HBM
+        #     RESOURCE_EXHAUSTED during backward reduce_scatter_tensor on 32B.
+        # (b) Strictly necessary or cluster-configurable?: Strictly necessary in code; TorchTitanEngine.__init__
+        #     previously ignored self.engine_config.dtype when constructing TrainingConfig.
+        # (c) Why smaller models (0.6B, 4B) didn't require it: 0.6B and 4B are 8x-50x smaller, so fp32
+        #     FSDP buffers fit comfortably inside 32 GB HBM per chip.
+        if device_name == "tpu" and self.engine_config.dtype == "bfloat16":
+            training_kwargs["dtype"] = "bfloat16"
         if (self.engine_config.offload_policy or self.engine_config.forward_only) and device_name != "tpu":
             training = TrainingConfig(enable_cpu_offload=True, **training_kwargs)
         else:
@@ -713,21 +723,49 @@ class TorchTitanEngine(BaseEngine):
         device = get_device_id()  # used when fsdp2 set cpu_offload_policy
 
         def _gen():
-            # TODO: cast fp32 to bf16 to reduce weight sync overhead, need more fine-grained control, e.g MoE gate
+            # Cast local shard to bf16 BEFORE full_tensor() all-gather to halve HBM peak and ICI traffic
             for name, param in dense.items():
                 if isinstance(param, DTensor):
-                    yield name, param.to(device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
+                    full_p = param.to(device=device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
+                    yield name, full_p
+                    del full_p
                 else:
-                    yield name, param.to(torch.bfloat16, non_blocking=True)
+                    yield (
+                        name,
+                        param.to(dtype=torch.bfloat16, non_blocking=True) if param.is_floating_point() else param,
+                    )
             # One stack at a time: the gathered (num_experts, ...) tensor is the peak allocation here.
             for stack, slots in expert_stacks:
-                full = stack.to(device, non_blocking=True)
+                full = stack.to(device=device, dtype=torch.bfloat16, non_blocking=True)
                 if isinstance(full, DTensor):
                     full = full.full_tensor()
-                full = full.to(torch.bfloat16, non_blocking=True)
                 for e, (hf_name, _shape) in enumerate(slots):
                     yield hf_name, full[e].clone()
                 del full
+            # (a) Why needed: torch_tpu executes lazily; after get_per_tensor_param() all-gathers FSDP2
+            #     shards (or when EngineEvalModeCtx / EngineTrainModeCtx exits), unsharded buffers and
+            #     pending HLO graphs can remain allocated in TPU HBM unless explicitly resharded and
+            #     synchronized before the next phase.
+            # (b) Strictly necessary or fixable another way?: Necessary when using TPUCheckpointEngine
+            #     (checkpoint_engine.backend=naive). Switching to checkpoint_engine.backend=raiden
+            #     (consumes_training_engine=True) exports local FSDP shards directly without calling
+            #     get_per_tensor_param(), avoiding the trainer-side all-gather during weight sync.
+            # (c) Why smaller models (0.6B, 4B) didn't require it: Holding an unsharded copy of 0.6B
+            #     (1.2 GB) or 4B (8 GB) in HBM alongside training states fits within 32 GB/chip, whereas
+            #     32B (64 GB in bf16) overflows HBM if unsharded buffers linger.
+            if self.engine_config.data_parallel_shard_size > 1:
+                for module in self.module:
+                    module.reshard()
+            try:
+                import gc
+
+                import torch_tpu
+
+                gc.collect()
+                torch_tpu._internal.sync.synchronize(wait=True)
+            except Exception:
+                pass
+            get_platform().empty_cache()
 
         # TODO: support Torchtitan PEFT
         return _gen(), None
@@ -752,6 +790,17 @@ class EngineEvalModeCtx(BaseEngineCtx):
                 module.reshard()
 
         super().__exit__(exc_type, exc_value, traceback)
+        # Flush lazy torch_tpu HLO graphs and release unsharded eval buffers before training step
+        try:
+            import gc
+
+            import torch_tpu
+
+            gc.collect()
+            torch_tpu._internal.sync.synchronize(wait=True)
+        except Exception:
+            pass
+        get_platform().empty_cache()
 
 
 class EngineTrainModeCtx(BaseEngineCtx):
@@ -768,7 +817,21 @@ class EngineTrainModeCtx(BaseEngineCtx):
         assert isinstance(self.engine, TorchTitanEngine)
         if self.zero_grad_on_exit or exc_type is not None:
             self.engine.optimizer_zero_grad()
+        # Reshard root FSDP module and flush lazy torch_tpu buffers before weight sync
+        if self.engine.engine_config.data_parallel_shard_size > 1:
+            for module in self.engine.module:
+                module.reshard()
         super().__exit__(exc_type, exc_value, traceback)
+        try:
+            import gc
+
+            import torch_tpu
+
+            gc.collect()
+            torch_tpu._internal.sync.synchronize(wait=True)
+        except Exception:
+            pass
+        get_platform().empty_cache()
 
 
 @EngineRegistry.register(model_type="language_model", backend=["torchtitan"], device=["cuda", "npu", "tpu"])

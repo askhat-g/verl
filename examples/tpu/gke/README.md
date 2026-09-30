@@ -1,20 +1,88 @@
 # GKE KubeRay Cluster & Docker Image for TPU v6e
 
-This directory contains the Docker image definition and KubeRay manifest for running `verl` (SFT and GRPO RL) on Google Kubernetes Engine (GKE) with **Cloud TPU v6e** (`tpu-v6e-slice`) node pools:
+This directory contains the Docker image definition and KubeRay `RayCluster` manifests for running `verl` (SFT and GRPO RL) on Google Kubernetes Engine (GKE) with **Cloud TPU v6e** (`tpu-v6e-slice`) node pools:
 
-- [`Dockerfile.tpu`](Dockerfile.tpu): Builds the unified TPU runtime image containing `torch==2.11.0`, `torch_tpu`, `torchtitan`, `vllm==0.14.0`, `vllm_tpu`, `jax==0.9.0`, `libtpu`, and `verl` (`us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260918-fi0918`).
-- [`ray-tpu-v6e8-2slice.yaml`](ray-tpu-v6e8-2slice.yaml): KubeRay `RayCluster` manifest provisioning 1 CPU Ray head pod (`ray-head`) and 2 multi-host TPU v6e-8 slices (`numOfHosts: 2`, `google.com/tpu: 4` per host = 16 TPU v6e chips total) with GCS Fuse mounted at `/data` and `400Gi` host memory per TPU pod.
+- [`Dockerfile.tpu`](Dockerfile.tpu): Builds the unified TPU runtime image containing `torch==2.13.0`, `torch_tpu`, `torchtitan`, `vllm==0.29.0`, `vllm-torchtpu`, `jax==0.10.2`, `libtpu==0.0.47`, and `verl` (`us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260930-grpo32b`).
+- [`ray-tpu-v6e8-2slice.yaml`](ray-tpu-v6e8-2slice.yaml): KubeRay `RayCluster` manifest for **Qwen3-0.6B / 4B / 8B / 14B** provisioning 1 CPU Ray head pod (`ray-head`) and 2 multi-host TPU v6e-8 slices (`replicas: 2`, `numOfHosts: 2`, `google.com/tpu: 4` per host = 16 TPU v6e chips total) with GCS Fuse mounted at `/data`.
+- [`ray-tpu-v6e16-v6e8-2slice.yaml`](ray-tpu-v6e16-v6e8-2slice.yaml): KubeRay `RayCluster` manifest for **Qwen3-32B** provisioning 1 CPU Ray head pod, 1 multi-host TPU v6e-16 trainer slice (`4x4`, `numOfHosts: 4` = 16 TPU v6e chips), and 1 multi-host TPU v6e-8 rollout slice (`2x4`, `numOfHosts: 2` = 8 TPU v6e chips; 24 chips total) with GCS Fuse mounted at `/data`.
+- [`model_0_6b_config.yaml`](model_0_6b_config.yaml), [`model_4b_config.yaml`](model_4b_config.yaml), [`model_8b_config.yaml`](model_8b_config.yaml), [`model_14b_config.yaml`](model_14b_config.yaml), [`model_32b_config.yaml`](model_32b_config.yaml): Self-contained per-model `RayCluster` + `ConfigMap` manifests that use node-local storage (`hostPath: /var/data` mounted at `/data`) and automatically bootstrap the HuggingFace model checkpoint (`Qwen/Qwen3-{0.6B,4B,8B,14B,32B}`) and GSM8K parquet dataset on pod startup (no shared GCS Fuse bucket required).
+
+| Model Size | Trainer Slice Topology | Rollout Slice Topology | Total TPU Chips | GCS Fuse Manifest | Self-Contained (HostPath + Auto-Download) Manifest |
+|------------|------------------------|------------------------|-----------------|-------------------|----------------------------------------------------|
+| Qwen3-0.6B | 1 x `v6e-8` (`2x4`, 8 chips) | 1 x `v6e-8` (`2x4`, 8 chips) | 16 | [`ray-tpu-v6e8-2slice.yaml`](ray-tpu-v6e8-2slice.yaml) | [`model_0_6b_config.yaml`](model_0_6b_config.yaml) |
+| Qwen3-4B | 1 x `v6e-8` (`2x4`, 8 chips) | 1 x `v6e-8` (`2x4`, 8 chips) | 16 | [`ray-tpu-v6e8-2slice.yaml`](ray-tpu-v6e8-2slice.yaml) | [`model_4b_config.yaml`](model_4b_config.yaml) |
+| Qwen3-8B | 1 x `v6e-8` (`2x4`, 8 chips) | 1 x `v6e-8` (`2x4`, 8 chips) | 16 | [`ray-tpu-v6e8-2slice.yaml`](ray-tpu-v6e8-2slice.yaml) | [`model_8b_config.yaml`](model_8b_config.yaml) |
+| Qwen3-14B | 1 x `v6e-8` (`2x4`, 8 chips) | 1 x `v6e-8` (`2x4`, 8 chips) | 16 | [`ray-tpu-v6e8-2slice.yaml`](ray-tpu-v6e8-2slice.yaml) | [`model_14b_config.yaml`](model_14b_config.yaml) |
+| Qwen3-32B | 1 x `v6e-16` (`4x4`, 16 chips) | 1 x `v6e-8` (`2x4`, 8 chips) | 24 | [`ray-tpu-v6e16-v6e8-2slice.yaml`](ray-tpu-v6e16-v6e8-2slice.yaml) | [`model_32b_config.yaml`](model_32b_config.yaml) |
 
 ---
 
-## 🛠️ Deploying the RayCluster on GKE
+## 🛠️ Provisioning & Managing Your GKE TPU Cluster
+
+### 1. Provision GKE TPU v6e Node Pools
+
+Create a GKE cluster (or connect to an existing one) and provision the TPU v6e multi-host slice node pools matching your target model size:
 
 ```bash
-# Apply the KubeRay cluster manifest
-kubectl apply -f examples/tpu/gke/ray-tpu-v6e8-2slice.yaml
+# Authenticate kubectl with your GKE cluster
+gcloud container clusters get-credentials <CLUSTER_NAME> --region <REGION> --project <PROJECT_ID>
 
-# Wait for 1 head pod + 4 TPU worker pods (2 slices x 2 hosts) to reach 2/2 Running
+# For 0.6B / 4B / 8B / 14B (2 x v6e-8 slices = two 2x4 node pools, 2 hosts per pool):
+gcloud container node-pools create tpu-v6e8-slice-1 \
+    --cluster <CLUSTER_NAME> --region <REGION> --project <PROJECT_ID> \
+    --node-locations <ZONE> --machine-type ct6e-standard-4t \
+    --tpu-topology 2x4 --num-nodes 2
+
+gcloud container node-pools create tpu-v6e8-slice-2 \
+    --cluster <CLUSTER_NAME> --region <REGION> --project <PROJECT_ID> \
+    --node-locations <ZONE> --machine-type ct6e-standard-4t \
+    --tpu-topology 2x4 --num-nodes 2
+
+# For 32B (additionally requires 1 x v6e-16 trainer slice = one 4x4 node pool, 4 hosts):
+gcloud container node-pools create tpu-v6e16-trainer \
+    --cluster <CLUSTER_NAME> --region <REGION> --project <PROJECT_ID> \
+    --node-locations <ZONE> --machine-type ct6e-standard-4t \
+    --tpu-topology 4x4 --num-nodes 4
+```
+
+Ensure the **KubeRay Operator** and **KubeRay TPU Initialization Webhook** are installed on the cluster so multi-host TPU slice environment variables (`TPU_WORKER_ID`, `TPU_WORKER_HOSTNAMES`, and `TPU-{num_chips}-head` resources) are injected into worker pods automatically:
+
+```bash
+helm repo add kuberay https://ray-project.github.io/kuberay-helm/
+helm repo update
+helm upgrade --install kuberay-operator kuberay/kuberay-operator --version 1.2.2
+```
+
+### 2. Deploy or Switch the RayCluster
+
+Apply either the GCS Fuse manifest or the self-contained per-model manifest:
+
+```bash
+# Option A: GCS Fuse cluster (2x v6e-8 for 0.6B/4B/8B/14B, or v6e-16 + v6e-8 for 32B)
+kubectl apply -f examples/tpu/gke/ray-tpu-v6e8-2slice.yaml
+# or for 32B:
+kubectl apply -f examples/tpu/gke/ray-tpu-v6e16-v6e8-2slice.yaml
+
+# Option B: Self-contained per-model cluster (auto-downloads HF checkpoint & GSM8K to /var/data)
+kubectl apply -f examples/tpu/gke/model_32b_config.yaml   # or model_{0_6b,4b,8b,14b}_config.yaml
+```
+
+To **switch between models or cluster topologies** (or cleanly reset TPU device state between runs), delete the existing `RayCluster` and apply the new manifest:
+
+```bash
+kubectl delete raycluster ray-tpu-v6e-cluster --wait=true
+kubectl apply -f examples/tpu/gke/model_32b_config.yaml
+```
+
+### 3. Verify Cluster Readiness & Connect to Ray Dashboard
+
+```bash
+# Wait for 1 head pod + all TPU worker pods (4 workers for 2x v6e-8; 6 workers for v6e-16 + v6e-8) to reach Running
 kubectl get pods -l ray.io/cluster=ray-tpu-v6e-cluster -w
+
+# Verify that all TPU chips and TPU-<N>-head slice resources are registered in Ray
+HEAD_POD=$(kubectl get pods -l ray.io/cluster=ray-tpu-v6e-cluster,ray.io/node-type=head -o jsonpath='{.items[0].metadata.name}')
+kubectl exec "${HEAD_POD}" -- ray status
 
 # Port-forward the Ray Dashboard / Job Submission API to localhost:23333
 kubectl port-forward svc/ray-tpu-v6e-cluster-head-svc 23333:8265 > /dev/null 2>&1 &
