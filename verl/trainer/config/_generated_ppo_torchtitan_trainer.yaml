@@ -48,6 +48,9 @@ actor_rollout_ref:
       strategy: torchtitan
       seed: 42
       full_determinism: false
+      use_splash_attention: false
+      tpu_eager_mode: null
+      use_simple_fsdp: false
       forward_only: false
       dtype: bfloat16
     _target_: verl.workers.config.TorchTitanActorConfig
@@ -194,6 +197,9 @@ actor_rollout_ref:
       strategy: torchtitan
       seed: ${oc.select:actor_rollout_ref.actor.torchtitan.seed,42}
       full_determinism: false
+      use_splash_attention: ${oc.select:actor_rollout_ref.actor.torchtitan.use_splash_attention,False}
+      tpu_eager_mode: ${oc.select:actor_rollout_ref.actor.torchtitan.tpu_eager_mode,null}
+      use_simple_fsdp: ${oc.select:actor_rollout_ref.actor.torchtitan.use_simple_fsdp,False}
       forward_only: true
       dtype: bfloat16
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
@@ -534,6 +540,9 @@ critic:
     strategy: torchtitan
     seed: 42
     full_determinism: false
+    use_splash_attention: false
+    tpu_eager_mode: null
+    use_simple_fsdp: false
     forward_only: false
     dtype: bfloat16
   _target_: verl.workers.config.TorchTitanCriticConfig

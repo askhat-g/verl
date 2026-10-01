@@ -79,6 +79,17 @@ DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}"
 ROLLOUT_IS="${ROLLOUT_IS:-token}"
 ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
 
+# TorchTitan trainer: the fastest validated 4B trainer config on v6e-8, following torchtitan's TPU recipes
+# (see torchtitan/experiments/tpu/torch-tpu-optimization-guide.md):
+#   * per-TransformerBlock torch.compile(backend="tpu") with the splash attention Pallas kernel (compile on
+#     TPU requires splash: compiled SDPA yields NaN gradients on torch_tpu);
+#   * SimpleFSDP: the FSDP all-gather/reduce-scatter are traced into each compiled block;
+#   * torch_tpu DEFER_AND_FUSE eager mode: ops outside the compiled blocks (LM head, log-prob/loss, grad
+#     clipping, optimizer) are fused into larger XLA programs instead of one program per op;
+#   * 4 packed sequences per trainer micro batch (actor update, old/ref log-prob).
+# Trainer compute per step (old_log_prob + ref + update_actor) is ~4.5 s vs ~37 s with all of the above off.
+# Weight sync uses the tpu checkpoint engine (gather to rank 0, publish through the Ray object store).
+
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
     trainer.v1.trainer_mode=separate_async \
@@ -106,16 +117,19 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.use_torch_compile=False \
-    actor_rollout_ref.actor.torchtitan.use_torch_compile=False \
+    actor_rollout_ref.actor.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_splash_attention=True \
+    actor_rollout_ref.actor.torchtitan.tpu_eager_mode=DEFER_AND_FUSE \
+    actor_rollout_ref.actor.torchtitan.use_simple_fsdp=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.torchtitan.tensor_parallel_size="${TENSOR_PARALLEL_SIZE}" \
@@ -123,6 +137,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.torchtitan.pipeline_parallel_size=1 \
     actor_rollout_ref.actor.torchtitan.attn_type=varlen \
     actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.enable_prefix_caching=False \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.no_enable_prefix_caching=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${TOTAL_ROLLOUT_CHIPS}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
@@ -131,7 +147,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.dtype=bfloat16 \
     actor_rollout_ref.rollout.layered_summon=True \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.rollout.checkpoint_engine.backend=tpu \
     actor_rollout_ref.rollout.enforce_eager=False \

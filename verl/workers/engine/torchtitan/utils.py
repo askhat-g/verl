@@ -167,6 +167,63 @@ def enable_fsdp_gradient_division(model: nn.Module, dp_size: int) -> None:
             module.set_gradient_divide_factor(float(dp_size))
 
 
+def make_simple_fsdp_parallelize_fn(parallelize_fn, *, spmd_safe_blocks: bool = False):
+    """Wrap a torchtitan ``parallelize_fn`` so it shards with SimpleFSDP instead of FSDP2.
+
+    Mirrors torchtitan's TPU recipes (``experiments/tpu/qwen3/infra/parallelize.py`` with
+    ``parallelism.use_simple_fsdp``): AC and per-block compile are applied by the model's own
+    ``parallelize_fn`` with ``skip_dp=True``, then graph_trainer's ``apply_simple_fsdp`` turns every parameter
+    into a ``Shard(0)`` DTensor behind a parametrization. Accessing ``module.weight`` all-gathers it (cast to the
+    param dtype) and its backward reduce-scatters the gradient (in the reduce dtype), so under ``torch.compile``
+    the FSDP collectives live inside each compiled TransformerBlock, and under activation checkpointing the
+    all-gather is recomputed in backward (reshard-after-forward semantics).
+
+    Differences from the TPU recipe handled here:
+      * Weight tying: ``data_parallel`` re-registers each module's parameter separately, which would untie
+        ``tok_embeddings.weight``/``lm_head.weight``; both modules are pointed back at the same sharded parameter.
+      * ``init_weights`` runs under ``disable_active_parametrization`` so initialization (and the decoder's
+        re-tie) sees the sharded parameters instead of all-gathered temporaries.
+
+    Gradients are summed, not averaged, across the data-parallel ranks (no FSDP2 gradient divide factor):
+    the engine scales the loss by ``1 / dp_size`` before backward.
+
+    Args:
+        parallelize_fn: The model's torchtitan ``parallelize_fn`` (must accept ``skip_dp``).
+        spmd_safe_blocks: Mark each TransformerBlock ``spmd_safe`` (torch_tpu) so the collectives traced into
+            the compiled blocks run as SPMD collectives. Needed on TPU with ``torch.compile``.
+    """
+    from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
+    from torchtitan.experiments.graph_trainer.simple_fsdp import disable_active_parametrization
+
+    def _parallelize(model: nn.Module, *, parallel_dims, training, compile_config, **kwargs) -> nn.Module:
+        if spmd_safe_blocks and compile_config.enable and hasattr(model, "layers"):
+            from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
+
+            for block in model.layers.values():
+                apply_spmd_safe(block)
+
+        kwargs.pop("skip_dp", None)
+        model = parallelize_fn(
+            model, parallel_dims=parallel_dims, training=training, compile_config=compile_config, skip_dp=True, **kwargs
+        )
+        tied = bool(getattr(model, "enable_weight_tying", False))
+        model = apply_simple_fsdp(model, parallel_dims=parallel_dims, training=training)
+        if tied:
+            model.tok_embeddings._parameters["weight"] = model.lm_head._parameters["weight"]
+
+        init_weights = model.init_weights
+
+        def _init_weights(*args, **init_kwargs):
+            with disable_active_parametrization():
+                return init_weights(*args, **init_kwargs)
+
+        model.init_weights = _init_weights
+        logger.info("Applied SimpleFSDP (weight tying preserved: %s, spmd_safe blocks: %s)", tied, spmd_safe_blocks)
+        return model
+
+    return _parallelize
+
+
 def get_attention_masks(
     input_batch: torch.Tensor,
     positions: torch.Tensor,

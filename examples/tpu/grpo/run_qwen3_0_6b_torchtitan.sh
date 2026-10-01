@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GRPO | Qwen3-0.6B | GSM8K | TorchTitan Training & vLLM Rollout | TPU v6e-8 x2 Slices
+# GRPO | Qwen3-0.6B | GSM8K | TorchTitan Training & vLLM Rollout | TPU 7x (2x2x1 Single-Host) & TPU v6e
 # V1 PPOTrainer (Separate Async Overlap)
 #
 # By default this runs a realistic 100-step GRPO job whose reward curve actually
@@ -31,6 +31,9 @@ set -xeuo pipefail
 
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
+# TPU generation: defaults to v6e (3D topology map). On TPU 7x, pass TPU_ACCELERATOR_TYPE=tpu7x
+# (e.g. via --runtime-env-json) to select the 4D topology map; it aborts libtpu on v6e.
+export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-v6e}"
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VLLM_USE_V1=1
 export RAY_memory_monitor_refresh_ms=0
@@ -72,11 +75,11 @@ fi
 project_name='verl_tpu_grpo'
 
 # Paths
-RAY_DATA_HOME="/data/jialei"
+RAY_DATA_HOME="${RAY_DATA_HOME:-/data/jialei}"
 MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-0.6B}"
 
-TRAIN_FILE="${RAY_DATA_HOME}/data/gsm8k/train.parquet"
-TEST_FILE="${RAY_DATA_HOME}/data/gsm8k/test.parquet"
+TRAIN_FILE="${TRAIN_FILE:-${RAY_DATA_HOME}/data/gsm8k/train.parquet}"
+TEST_FILE="${TEST_FILE:-${RAY_DATA_HOME}/data/gsm8k/test.parquet}"
 
 # TPU topology. Defaults target 2 x v6e-8 slices (trainer on slice 0, rollout on slice 1);
 # override e.g. NNODES_TRAINER=1 N_CHIPS_TRAINER=4 NNODES_ROLLOUT=1 N_CHIPS_ROLLOUT=4 to run
@@ -113,6 +116,13 @@ if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
     set -x
 fi
 
+# TorchTitan trainer, following torchtitan's TPU recipes
+# (see torchtitan/experiments/tpu/torch-tpu-optimization-guide.md):
+#   * per-TransformerBlock torch.compile(backend="tpu") with the splash attention Pallas kernel (compile on
+#     TPU requires splash: compiled SDPA yields NaN gradients on torch_tpu);
+#   * SimpleFSDP: the FSDP all-gather/reduce-scatter are traced into each compiled block;
+#   * torch_tpu DEFER_AND_FUSE eager mode: ops outside the compiled blocks are fused into larger XLA programs.
+
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
     trainer.v1.trainer_mode=separate_async \
@@ -138,8 +148,11 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.use_torch_compile=False \
-    actor_rollout_ref.actor.torchtitan.use_torch_compile=False \
+    actor_rollout_ref.actor.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_splash_attention=True \
+    actor_rollout_ref.actor.torchtitan.use_simple_fsdp=True \
+    actor_rollout_ref.actor.torchtitan.tpu_eager_mode=DEFER_AND_FUSE \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \

@@ -81,6 +81,19 @@ seed: 42
 # Whether to enable full determinism for distributed training, only for debugging
 full_determinism: false
 
+# TPU only: use the splash attention Pallas kernel (torchtitan.experiments.tpu) for attention.
+# Required on TPU when use_torch_compile=true (compiled SDPA yields NaN gradients on torch_tpu).
+use_splash_attention: false
+
+# TPU only: torch_tpu eager execution mode for forward/backward and optimizer step
+# (null keeps the torch_tpu default DEFER_NEVER; DEFER_AND_FUSE fuses ops outside compiled blocks)
+tpu_eager_mode: null
+
+# Shard parameters with torchtitan's SimpleFSDP (DTensor parametrization: the FSDP all-gather and
+# reduce-scatter are traced into each compiled TransformerBlock) instead of FSDP2 hooks, as
+# torchtitan's TPU recipes do. Pure FSDP/HSDP only (no TP/PP/CP/EP)
+use_simple_fsdp: false
+
 # Whether to use forward only
 forward_only: false
 
