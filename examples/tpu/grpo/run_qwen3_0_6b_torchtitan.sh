@@ -116,6 +116,13 @@ if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
     set -x
 fi
 
+# TorchTitan trainer, following torchtitan's TPU recipes
+# (see torchtitan/experiments/tpu/torch-tpu-optimization-guide.md):
+#   * per-TransformerBlock torch.compile(backend="tpu") with the splash attention Pallas kernel (compile on
+#     TPU requires splash: compiled SDPA yields NaN gradients on torch_tpu);
+#   * SimpleFSDP: the FSDP all-gather/reduce-scatter are traced into each compiled block;
+#   * torch_tpu DEFER_AND_FUSE eager mode: ops outside the compiled blocks are fused into larger XLA programs.
+
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
     trainer.v1.trainer_mode=separate_async \
@@ -141,8 +148,11 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.use_torch_compile=False \
-    actor_rollout_ref.actor.torchtitan.use_torch_compile=False \
+    actor_rollout_ref.actor.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_splash_attention=True \
+    actor_rollout_ref.actor.torchtitan.use_simple_fsdp=True \
+    actor_rollout_ref.actor.torchtitan.tpu_eager_mode=DEFER_AND_FUSE \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \

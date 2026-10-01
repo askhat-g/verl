@@ -54,12 +54,16 @@ from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.torchtitan.tpu_utils import (
+    align_micro_batch_shapes_across_ranks,
+    apply_splash_attention_tpu,
     bucket_length,
     compute_global_batch_num_tokens,
+    configure_torch_compile_for_tpu,
     monkey_patch_varlen_attention_tpu,
     pad_packed_inputs_for_tpu,
     safe_to_padded_tensor,
     synchronize_tpu_loss,
+    tpu_eager_mode_context,
     unwrap_metadata,
     vocab_parallel_logprobs_from_logits,
 )
@@ -68,6 +72,7 @@ from verl.workers.engine.torchtitan.utils import (
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
     get_attention_masks,
+    make_simple_fsdp_parallelize_fn,
 )
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
@@ -139,6 +144,7 @@ class TorchTitanEngine(BaseEngine):
         self.engine_config = engine_config
         self.optimizer_config = optimizer_config
         self.checkpoint_config = checkpoint_config
+        self.engine_config.check_device_support(device_name)
 
         # Derive torchtitan model name and flavor from HF config
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
@@ -146,6 +152,11 @@ class TorchTitanEngine(BaseEngine):
         # Get ModelSpec from model registry
         model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
         model_spec = model_module.model_registry(torchtitan_flavor, attn_backend=self.engine_config.attn_type)
+        self._use_simple_fsdp = self.engine_config.use_simple_fsdp
+        if self._use_simple_fsdp:
+            model_spec.parallelize_fn = make_simple_fsdp_parallelize_fn(
+                model_spec.parallelize_fn, spmd_safe_blocks=device_name == "tpu"
+            )
 
         # Use foreach optimizer implementation on TPU.
         impl = "foreach" if get_platform().device_name == "tpu" else "fused"
@@ -251,9 +262,26 @@ class TorchTitanEngine(BaseEngine):
             # verl uses its own loss function and ignores this one.
             loss=CrossEntropyLoss.Config(),
         )
+        if device_name == "tpu" and self.engine_config.use_torch_compile:
+            configure_torch_compile_for_tpu()
         self.trainer = Trainer(self.config)
 
         self._init_device_mesh()
+
+        self._use_splash_attention = device_name == "tpu" and self.engine_config.use_splash_attention
+        if self._use_splash_attention:
+            apply_splash_attention_tpu(self.trainer.model_parts)
+        elif self.engine_config.use_splash_attention:
+            logger.warning("use_splash_attention is only supported on TPU; ignoring it on %s", device_name)
+
+        if device_name == "tpu" and self.engine_config.use_torch_compile:
+            # nn.Module.compile() stores the compiled forward in `_compiled_call_impl`.
+            n_compiled = sum(
+                getattr(m, "_compiled_call_impl", None) is not None
+                for part in self.trainer.model_parts
+                for m in part.modules()
+            )
+            logger.warning(f"torch.compile(backend='tpu') enabled on {n_compiled} modules")
 
         if get_device_name() == "tpu" and torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -261,7 +289,10 @@ class TorchTitanEngine(BaseEngine):
         # Re-enable FSDP's gradient division for verl's loss scaling.
         # TorchTitan disables gradient division by default (for global token normalization),
         # but verl's loss function multiplies by dp_size to compensate for gradient averaging.
-        if self.engine_config.data_parallel_shard_size > 1:
+        # SimpleFSDP has no divide factor (its backward reduce-scatter sums), so forward_backward_batch
+        # scales the loss by 1 / dp_size before backward instead.
+        self._simple_fsdp_loss_scale = 1.0 / self.get_data_parallel_size() if self._use_simple_fsdp else None
+        if self.engine_config.data_parallel_shard_size > 1 and not self._use_simple_fsdp:
             dp_size = self.get_data_parallel_size()
             for model_part in self.trainer.model_parts:
                 enable_fsdp_gradient_division(model_part, dp_size)
@@ -278,11 +309,13 @@ class TorchTitanEngine(BaseEngine):
         else:
             entropy_from_logits = verl_F.entropy_from_logits
 
-        self.compute_entropy_from_logits = (
-            torch.compile(entropy_from_logits, dynamic=True)
-            if self.engine_config.use_torch_compile
-            else entropy_from_logits
-        )
+        if not self.engine_config.use_torch_compile:
+            self.compute_entropy_from_logits = entropy_from_logits
+        elif device_name == "tpu":
+            # Inductor has no TPU codegen; shapes are bucketed, so compile them statically.
+            self.compute_entropy_from_logits = torch.compile(entropy_from_logits, backend="tpu", dynamic=False)
+        else:
+            self.compute_entropy_from_logits = torch.compile(entropy_from_logits, dynamic=True)
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -423,6 +456,9 @@ class TorchTitanEngine(BaseEngine):
             dp_group=self.get_data_parallel_group(),
             same_micro_num_in_dp=True,
         )
+        if is_tpu and self._use_simple_fsdp:
+            # SimpleFSDP's collectives run inside the compiled blocks: every rank must run the same program.
+            align_micro_batch_shapes_across_ranks(micro_batches)
 
         output_lst = []
 
@@ -432,14 +468,24 @@ class TorchTitanEngine(BaseEngine):
         # span backward too, since activation-checkpoint recompute re-runs the forward there.
         # record_function names each micro-batch so a forward-only stage (compute_log_prob /
         # compute_ref_log_prob) shows "micro_batch<i>" rows instead of a single anonymous forward.
-        for micro_batch_idx, micro_batch in enumerate(micro_batches):
-            with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
-                loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
-                if not forward_only:
-                    if get_device_name() == "tpu":
-                        synchronize_tpu_loss(loss)
-                    loss.backward()
-            output_lst.append(output)
+        with tpu_eager_mode_context(self.engine_config.tpu_eager_mode if is_tpu else None):
+            for micro_batch_idx, micro_batch in enumerate(micro_batches):
+                with (
+                    self.trainer.train_context(),
+                    ctx,
+                    torch.profiler.record_function(f"micro_batch{micro_batch_idx}"),
+                ):
+                    loss, output = self.forward_step(
+                        micro_batch, loss_function=loss_function, forward_only=forward_only
+                    )
+                    if not forward_only:
+                        if self._simple_fsdp_loss_scale is not None:
+                            # SimpleFSDP sums gradients across DP ranks; FSDP2 here averages them.
+                            loss = loss * self._simple_fsdp_loss_scale
+                        if is_tpu:
+                            synchronize_tpu_loss(loss)
+                        loss.backward()
+                output_lst.append(output)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
@@ -481,27 +527,29 @@ class TorchTitanEngine(BaseEngine):
 
     def optimizer_step(self):
         """Perform optimizer step with gradient clipping."""
-        # torch._foreach_norm (the `foreach=True` path) is unreliable on the TPU backend:
-        # it returns inf even when every gradient is exactly zero. Since a non-finite
-        # grad_norm makes this method skip the update entirely, that silently froze the
-        # policy while the job still reported success. Use the per-tensor path there.
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for m in self.module for p in m.parameters()],
-            self.config.training.max_norm,
-            foreach=get_device_name() != "tpu",
-            pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
-            ep_enabled=self.parallel_dims.ep_enabled,
-        )
+        is_tpu = get_device_name() == "tpu"
+        with tpu_eager_mode_context(self.engine_config.tpu_eager_mode if is_tpu else None):
+            # torch._foreach_norm (the `foreach=True` path) is unreliable on the TPU backend:
+            # it returns inf even when every gradient is exactly zero. Since a non-finite
+            # grad_norm makes this method skip the update entirely, that silently froze the
+            # policy while the job still reported success. Use the per-tensor path there.
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in self.module for p in m.parameters()],
+                self.config.training.max_norm,
+                foreach=not is_tpu,
+                pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
+                ep_enabled=self.parallel_dims.ep_enabled,
+            )
 
-        # If grad_norm is not finite the update is thrown away. This is silent by design,
-        # so say it loudly: a run where this fires on every step reports success while the
-        # policy never changes.
-        if not torch.isfinite(grad_norm):
-            logger.warning(f"grad_norm is not finite ({grad_norm}); skipping this optimizer step")
-            self.optimizer.zero_grad()
-        else:
-            self.optimizer.step()
-        return grad_norm.item()
+            # If grad_norm is not finite the update is thrown away. This is silent by design,
+            # so say it loudly: a run where this fires on every step reports success while the
+            # policy never changes.
+            if not torch.isfinite(grad_norm):
+                logger.warning(f"grad_norm is not finite ({grad_norm}); skipping this optimizer step")
+                self.optimizer.zero_grad()
+            else:
+                self.optimizer.step()
+            return grad_norm.item()
 
     def lr_scheduler_step(self):
         """Advance learning rate scheduler."""
@@ -746,10 +794,16 @@ class EngineEvalModeCtx(BaseEngineCtx):
     def __exit__(self, exc_type, exc_value, traceback):
         assert isinstance(self.engine, TorchTitanEngine)
 
-        # Reshard the root FSDP module
+        # Reshard every FSDP2 module: FSDPModule.reshard() is not recursive, so resharding only the root left
+        # the per-layer modules gathered under reshard_after_forward="never". The isinstance check also makes
+        # this a no-op under SimpleFSDP, whose modules are not FSDPModules (and have no reshard()).
         if self.engine.engine_config.data_parallel_shard_size > 1:
+            from torch.distributed.fsdp import FSDPModule
+
             for module in self.engine.module:
-                module.reshard()
+                for submodule in module.modules():
+                    if isinstance(submodule, FSDPModule):
+                        submodule.reshard()
 
         super().__exit__(exc_type, exc_value, traceback)
 
@@ -792,6 +846,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     position_ids=position_ids,
                     micro_batch=micro_batch,
                     device=get_device_id(),
+                    build_attention_mask=not self._use_splash_attention,
                 )
                 output_args["orig_seq_len"] = orig_seq_len
             else:

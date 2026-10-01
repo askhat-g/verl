@@ -26,4 +26,7 @@ torchtitan:
   context_parallel_size: ${oc.select:actor_rollout_ref.actor.torchtitan.context_parallel_size,1}
   attn_type: ${oc.select:actor_rollout_ref.actor.torchtitan.attn_type,flex}
   use_torch_compile: ${oc.select:actor_rollout_ref.actor.torchtitan.use_torch_compile,True}
+  use_splash_attention: ${oc.select:actor_rollout_ref.actor.torchtitan.use_splash_attention,False}
+  tpu_eager_mode: ${oc.select:actor_rollout_ref.actor.torchtitan.tpu_eager_mode,null}
+  use_simple_fsdp: ${oc.select:actor_rollout_ref.actor.torchtitan.use_simple_fsdp,False}
   forward_only: True
