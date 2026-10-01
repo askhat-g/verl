@@ -27,7 +27,7 @@ import torch
 
 from .platform_cuda import PlatformCUDA
 from .platform_manager import PlatformRegistry, get_platform
-from .platform_tpu_workarounds import convert_tensors_to_scalars
+from .platform_tpu_workarounds import convert_tensors_to_scalars, patch_ray_worker
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -507,17 +507,9 @@ class PlatformTPU(PlatformCUDA):
 
     def get_ray_init_kwargs(self) -> dict[str, Any]:
         """Return Ray initialization arguments with runtime_env configured for GKE TPU workers."""
-        # (a) Why we removed "worker_process_setup_hook": patch_ray_worker:
-        #     When vLLM V1 (TP=8 across 2 hosts) spawns EngineCore in a subprocess and uses
-        #     RayDistributedExecutor to launch RayWorkerWrapper actors, inheriting worker_process_setup_hook
-        #     in runtime_env causes actor startup to fail. On ray==2.53.0+, the old IndexError patch is
-        #     no longer needed.
-        # (b) Strictly necessary or cluster-configurable?: Strictly necessary in code for multi-host vLLM
-        #     (TP=8) with RayDistributedExecutor.
-        # (c) Why smaller models (0.6B, 4B) didn't require it: 0.6B (TP=1) and 4B (TP=2/4) fit on a single
-        #     4-chip TPU host (uni/mp executor) and never spawn cross-node RayWorkerWrapper actors.
         return {
             "runtime_env": {
+                "worker_process_setup_hook": patch_ray_worker,
                 "env_vars": {"VERL_PLATFORM": "tpu"},
             }
         }
