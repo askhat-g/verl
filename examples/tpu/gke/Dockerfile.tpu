@@ -18,6 +18,10 @@ RUN pip uninstall -y torch torchvision || true
 RUN pip install --upgrade pip uv keyrings.google-artifactregistry-auth pandas==2.3.3
 
 ARG AUTH_TOKEN
+
+ARG TORCH_TPU_VERSION=0.1.1+release.2026.9.22.20260927223741
+ARG TPU_SYNC_VERSION=0.0.1.dev20261001132139
+
 # Use PIP_EXTRA_INDEX_URL so PyPI remains the primary index for standard packages like JAX
 ENV PIP_EXTRA_INDEX_URL="https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
@@ -32,8 +36,8 @@ RUN pip install torchvision==0.28.0 --index-url https://download.pytorch.org/whl
 RUN pip install libtpu==0.0.47 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
 RUN pip install --pre --no-deps \
-    "torch-tpu==0.1.1.dev20260912075415" \
-    "tpu-sync-torch==0.0.1.dev20260927082445" \
+    "torch-tpu==${TORCH_TPU_VERSION}" \
+    "tpu-sync-torch==${TPU_SYNC_VERSION}" \
     --index-url "https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
 RUN pip install 'typeguard==2.13.3'
@@ -95,8 +99,8 @@ RUN pip install --no-cache-dir \
 # Re-verify and lock exact PyTorch / TorchTPU / JAX / libtpu / Transformers versions after all dependency resolvers run
 RUN pip install --no-deps torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu && \
     pip install --pre --no-deps \
-    "torch-tpu==0.1.1.dev20260912075415" \
-    "tpu-sync-torch==0.0.1.dev20260927082445" \
+    "torch-tpu==${TORCH_TPU_VERSION}" \
+    "tpu-sync-torch==${TPU_SYNC_VERSION}" \
     --index-url "https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" && \
     pip install --no-deps \
     "jax==0.10.2" \
@@ -106,6 +110,13 @@ RUN pip install --no-deps torch==2.13.0 torchvision==0.28.0 --index-url https://
     "transformers>=5.10.4,<5.11" \
     "fastapi<0.137" \
     -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+# Fail the build if the installed torch / torch_tpu / tpu-sync drifted from the pinned pair above.
+RUN python -c "import importlib.metadata as m, sys; \
+want = {'torch': '2.13.0+cpu', 'torch-tpu': '${TORCH_TPU_VERSION}', 'tpu-sync-torch': '${TPU_SYNC_VERSION}'}; \
+got = {k: m.version(k) for k in want}; \
+print('Pinned torch / torch_tpu / tpu-sync:', got); \
+sys.exit(0 if got == want else f'Version drift: want {want}, got {got}')"
 
 WORKDIR /app
 
