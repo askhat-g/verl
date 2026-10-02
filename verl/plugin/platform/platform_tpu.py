@@ -404,12 +404,13 @@ class PlatformTPU(PlatformCUDA):
         # (c) Why smaller models (0.6B, 4B) didn't require it: Smaller models used homogeneous clusters where
         #     every TPU node was v6e-8 (world_size=8).
         tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
-        local_tpu_nodes = [n for n in tpu_nodes if n.get("NodeManagerAddress") == local_ip]
+        target_ips = set(bundle_ips) if bundle_ips else {local_ip}
+        local_tpu_nodes = [n for n in tpu_nodes if n.get("NodeManagerAddress") in target_ips]
         target_node = local_tpu_nodes[0] if local_tpu_nodes else (tpu_nodes[0] if tpu_nodes else {})
         tpu_type = target_node.get("Labels", {}).get("ray.io/tpu-pod-type", "")
 
         topo_map = get_tpu_topology_map()
-        topo = topo_map.get(tpu_type) or topo_map.get(world_size, topo_map[1])
+        topo = topo_map.get(world_size) or topo_map.get(tpu_type, topo_map[1])
         chips_bounds = topo_map[1]
 
         env_vars.update(
@@ -435,25 +436,46 @@ class PlatformTPU(PlatformCUDA):
 
         return env_vars
 
-   
-    def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
+    def auto_assign_accelerator_type(
+        self, name_prefix: str, accelerator_type: Optional[str], num_nodes: Optional[int] = None
+    ) -> Optional[str]:
         """Dynamically assign a TPU slice/group or node affinity to a resource pool on multi-slice clusters."""
         if accelerator_type is not None:
             return accelerator_type
 
         is_rollout_pool = any(k in name_prefix.lower() for k in ["rollout", "reward", "teacher"])
 
+        # (a) Why needed: Matches each RayResourcePool (num_nodes) to the tpu-group-* resource with the
+        #     exact number of alive nodes (4 nodes for v6e-16 trainer, 2 nodes for v6e-8 rollout) instead
+        #     of relying only on alphabetical sorting of slice names.
+        # (b) Strictly necessary or cluster-configurable?: Can be avoided via cluster/YAML naming if the
+        #     trainer worker group name always sorts alphabetically before the rollout group name (or if
+        #     accelerator_type is passed explicitly), but matching by num_nodes prevents misplacement.
+        # (c) Why smaller models (0.6B, 4B) didn't require it: Smaller models used two identical 2-node
+        #     v6e-8 slices, so both slices had the same node count and were interchangeable.
         try:
             if ray.is_initialized():
                 tpu_nodes = [n for n in ray.nodes() if n.get("Alive") and "TPU" in n.get("Resources", {})]
-                tpu_slices = sorted(
-                    {res for n in tpu_nodes for res in n.get("Resources", {}) if res.startswith("tpu-group-")}
-                )
-                if not tpu_slices:
-                    # Single-host slices (numOfHosts=1) omit tpu-group-* resources; pin by node:<ip> instead.
-                    tpu_slices = sorted(
-                        f"node:{n['NodeManagerAddress']}" for n in tpu_nodes if n.get("NodeManagerAddress")
+                slice_counts: dict[str, int] = {}
+                for node in tpu_nodes:
+                    for res in node.get("Resources", {}):
+                        if res.startswith("tpu-group-"):
+                            slice_counts[res] = slice_counts.get(res, 0) + 1
+
+                if slice_counts:
+                    target_nodes = num_nodes or int(
+                        os.environ.get("NNODES_ROLLOUT" if is_rollout_pool else "NNODES_TRAINER", "2")
                     )
+                    exact_slices = sorted([s for s, c in slice_counts.items() if c == target_nodes])
+                    if exact_slices:
+                        return exact_slices[1] if (len(exact_slices) >= 2 and is_rollout_pool) else exact_slices[0]
+                    tpu_slices = [
+                        s for s, _ in sorted(slice_counts.items(), key=lambda kv: (abs(kv[1] - target_nodes), kv[0]))
+                    ]
+                    return tpu_slices[1] if (len(tpu_slices) >= 2 and is_rollout_pool) else tpu_slices[0]
+
+                # Single-host slices (numOfHosts=1) omit tpu-group-* resources; pin by node:<ip> instead.
+                tpu_slices = sorted(f"node:{n['NodeManagerAddress']}" for n in tpu_nodes if n.get("NodeManagerAddress"))
                 if tpu_slices:
                     return tpu_slices[1] if (len(tpu_slices) >= 2 and is_rollout_pool) else tpu_slices[0]
         except Exception:

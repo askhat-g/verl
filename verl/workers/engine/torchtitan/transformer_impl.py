@@ -788,8 +788,12 @@ class TorchTitanEngine(BaseEngine):
             #     (1.2 GB) or 4B (8 GB) in HBM alongside training states fits within 32 GB/chip, whereas
             #     32B (64 GB in bf16) overflows HBM if unsharded buffers linger.
             if self.engine_config.data_parallel_shard_size > 1:
+                from torch.distributed.fsdp import FSDPModule
+
                 for module in self.module:
-                    module.reshard()
+                    for submodule in module.modules():
+                        if isinstance(submodule, FSDPModule):
+                            submodule.reshard()
             try:
                 import gc
 
@@ -857,10 +861,14 @@ class EngineTrainModeCtx(BaseEngineCtx):
         assert isinstance(self.engine, TorchTitanEngine)
         if self.zero_grad_on_exit or exc_type is not None:
             self.engine.optimizer_zero_grad()
-        # Reshard root FSDP module and flush lazy torch_tpu buffers before weight sync
+        # Reshard every FSDP2 module and flush lazy torch_tpu buffers before weight sync
         if self.engine.engine_config.data_parallel_shard_size > 1:
+            from torch.distributed.fsdp import FSDPModule
+
             for module in self.engine.module:
-                module.reshard()
+                for submodule in module.modules():
+                    if isinstance(submodule, FSDPModule):
+                        submodule.reshard()
         super().__exit__(exc_type, exc_value, traceback)
         try:
             import gc
