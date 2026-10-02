@@ -272,11 +272,20 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             )
 
         # 3. Allocate local TPU staging buffers matching Trainer un-fused layout and sharding specs
+        # TODO(tpu): Copy the received weights straight into vLLM's parameters, with no staging copy. The
+        # staging tensors are a second full copy of this rank's TP shard (~1.9 GiB per chip for Qwen3-8B,
+        # ~7.6 GiB for Qwen3-32B at TP=8) that must fit next to vLLM's preallocated weights and KV cache on
+        # every sync. Unfused tensors (o_proj, down_proj, norms, embed_tokens, lm_head) could bind the vLLM
+        # parameter buffers directly; fused qkv_proj / gate_up_proj and transposed (_tpu_weight_flipped)
+        # weights need tpu_sync to write into a slice or layout of the target tensor.
+        from verl.checkpoint_engine.raiden_checkpoint_engine import apply_raiden_skip_tiling, raiden_is_tile_aligned
+
         ROW_PARALLEL_SUFFIXES = (".o_proj.weight", ".down_proj.weight")
 
         staging_tensors = {}
         variable_protos = []
         valid_params = []
+        skip_tiling_plan = []
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
@@ -299,6 +308,8 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             t = torch.empty(local_shape, dtype=torch.bfloat16, device=torch.device("tpu"))
             staging_tensors[name] = t
             valid_params.append((name, t))
+            # Tile-aligned local shards can skip the CPU (de)tiling pass and DMA straight to HBM.
+            skip_tiling_plan.append(raiden_is_tile_aligned(local_shape))
 
             variable_protos.append(
                 raiden_service_pb2.VariableMetadataProto(
@@ -335,6 +346,9 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             listener_port=listener_port,
             bind_ip=bind_ip,
         )
+
+        self._skip_tiling_plan = skip_tiling_plan
+        apply_raiden_skip_tiling(self._raiden_ws, skip_tiling_plan)
 
         try:
             from tpu_sync.rpc import raiden_controller
@@ -374,6 +388,11 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         t_start = time.perf_counter()
         t_h2d_start = time.perf_counter()
+        # Re-apply the skip_tiling plan right before H2D: the network listener overwrites it with its default.
+        if getattr(self, "_skip_tiling_plan", None):
+            from verl.checkpoint_engine.raiden_checkpoint_engine import apply_raiden_skip_tiling
+
+            apply_raiden_skip_tiling(self._raiden_ws, self._skip_tiling_plan)
         self._raiden_ws.h2d()
         t_h2d = time.perf_counter() - t_h2d_start
 
@@ -458,8 +477,12 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
                 adapted = to_target_layout(src_t, target_local, is_flipped)
                 target_local.copy_(adapted)
 
-        # 3. Handle tied word embeddings
-        if (
+        # 3. Handle tied word embeddings. Only when the trainer did not send lm_head itself: for untied
+        #    models (e.g. Qwen3-8B / 32B) the received lm_head must not be overwritten by embed_tokens.
+        received_lm_head = any(k == "lm_head.weight" or k.endswith(".lm_head.weight") for k in self._raiden_staging)
+        if received_lm_head:
+            pass
+        elif (
             hasattr(vllm_model, "lm_head")
             and hasattr(vllm_model, "model")
             and hasattr(vllm_model.model, "embed_tokens")

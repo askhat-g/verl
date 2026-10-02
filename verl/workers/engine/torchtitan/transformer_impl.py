@@ -344,6 +344,21 @@ class TorchTitanEngine(BaseEngine):
             is_collect = is_collect and (cp_mesh.get_local_rank() == 0)
         return is_collect
 
+    def _drop_checkpoint_state_dict_cache(self):
+        """Free torchtitan ``ModelWrapper.cached_state_dict`` after loading.
+
+        The cache exists for async DCP staging (stable storage across saves). Parameter entries are views,
+        but entries produced by module state_dict hooks are fresh allocations: with fused ``wqkv`` the split
+        hook gathers full-size replicated ``wq/wk/wv`` per layer (fp32, ~3.4 GiB per chip for Qwen3-8B),
+        which would otherwise stay resident for the whole run. ``ModelWrapper.state_dict()`` repopulates
+        missing keys on the next save, so dropping the cache only costs a transient re-allocation then.
+        """
+        from torchtitan.components.checkpoint import MODEL
+
+        wrapper = getattr(self.checkpointer, "states", {}).get(MODEL)
+        if wrapper is not None and hasattr(wrapper, "cached_state_dict"):
+            wrapper.cached_state_dict = {}
+
     def initialize(self):
         """
         Build the model, optimizer, and learning rate scheduler with TorchTitan parallelism.
@@ -355,6 +370,7 @@ class TorchTitanEngine(BaseEngine):
         self.checkpointer = self.trainer.checkpointer
         # load initial HF weights
         self.checkpointer.load()
+        self._drop_checkpoint_state_dict_cache()
 
         if not self.engine_config.forward_only:
             self.optimizer = self.trainer.optimizers
@@ -701,6 +717,19 @@ class TorchTitanEngine(BaseEngine):
     def get_per_tensor_param_shard(self, **kwargs):
         """Yield this rank's *local* shard ``(hf_name, local_flat_bf16, ShardSpec)`` instead of the full tensor."""
         self._assert_shard_export_supported()
+        # TODO: skip the q/k/v all-gather. torchtitan builds Qwen3 with a fused ``wqkv`` (FusedQKVLinear,
+        # Shard(0) over KV-group-interleaved rows), and ``state_dict()`` runs its ``_split_qkv_on_save`` hook,
+        # which redistributes every layer's ``wqkv`` to Replicate() (an fp32 all-gather) before splitting it
+        # into wq/wk/wv. So q/k/v come back fully replicated and every rank exports (and raiden binds) the full
+        # tensors: ~1.8 GB bf16 per rank plus a ~3.6 GB fp32 transient at 8B, ~6.7 GB plus ~13.4 GB at 32B,
+        # however many trainer ranks there are. Options:
+        #   - build the model with fuse_qkv=False: works for any dp_shard, but torchtitan's model_registry
+        #     does not expose the flag yet;
+        #   - split the local ``wqkv`` shard without the hook: if n_kv_heads % dp_shard == 0 each rank holds
+        #     whole KV groups, i.e. Shard(0) blocks of q_proj/k_proj/v_proj (8B on 8 ranks: one group of
+        #     4 q + 1 k + 1 v heads). Qwen3-32B also has 8 KV heads, so this caps dp_shard at 8;
+        #   - patch the hook to skip the gather in that case.
+        # Check: at 8B, rank 0 should export q_proj as [512, 4096] instead of [4096, 4096].
         raw = {}
         for module in self.module:
             raw.update(module.state_dict())

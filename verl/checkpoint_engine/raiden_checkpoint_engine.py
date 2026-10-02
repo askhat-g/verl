@@ -103,11 +103,29 @@ def _unwrap_tensor(t: Any) -> Any:
     return t
 
 
-def filter_tied_embeddings(named_items: Iterable[tuple[str, Any]]) -> list[tuple[str, Any]]:
-    """Exclude redundant lm_head weights if embedding tokens are present."""
+def filter_tied_embeddings(
+    named_items: Iterable[tuple[str, Any]], tie_word_embeddings: bool = True
+) -> list[tuple[str, Any]]:
+    """Drop ``lm_head.weight`` from the weights to send when it is tied to the input embedding.
+
+    For tied models (``tie_word_embeddings=True``, e.g. Qwen3-0.6B / 4B), ``lm_head.weight`` is the same
+    tensor as ``embed_tokens.weight``, so it is not sent; the sampler copies ``embed_tokens`` into its
+    ``lm_head`` after receiving the weights.
+
+    For untied models (``tie_word_embeddings=False``, e.g. Qwen3-8B and larger), ``lm_head.weight`` is a
+    separate trained weight and is kept. Dropping it would leave the sampler with a wrong ``lm_head``
+    (stale, or overwritten with ``embed_tokens``).
+
+    Args:
+        named_items: ``(name, tensor)`` pairs in HF naming.
+        tie_word_embeddings: ``hf_config.tie_word_embeddings`` of the trained model.
+
+    Returns:
+        The ``(name, tensor)`` pairs to send.
+    """
     items = list(named_items)
     has_embed = any("embed_tokens" in k or "tok_embeddings" in k for k, _ in items)
-    if has_embed:
+    if has_embed and tie_word_embeddings:
         items = [(k, v) for k, v in items if not (k == "lm_head.weight" or k.endswith(".lm_head.weight"))]
     return items
 
@@ -178,19 +196,24 @@ def _dim0_shard_info(spec) -> Optional[tuple[tuple, int, int]]:
     return tuple(place.local_shape), num_shards, int(place.global_offset[0]) // (full_dim0 // num_shards)
 
 
-def export_local_shards(engine) -> tuple[list[tuple[str, torch.Tensor]], dict[str, tuple[int, int]]]:
+def export_local_shards(
+    engine, tie_word_embeddings: bool = True
+) -> tuple[list[tuple[str, torch.Tensor]], dict[str, tuple[int, int]]]:
     """Export this rank's weights for Raiden without all-gathering FSDP shards.
 
     Returns ``(named_tensors, shard_info)``. ``shard_info[name] = (num_shards, shard_index)`` for tensors
     exported as a local dim-0 shard; tensors absent from it are full (replicated) on every rank. Tensors
     whose layout Raiden cannot express are all-gathered here, in the same order on every rank.
+    ``lm_head.weight`` is dropped only for tied models (see ``filter_tied_embeddings``).
     """
     from torch.distributed.tensor import DTensor
 
     from verl.workers.engine.spec import BlockPlacement, derive_dtensor_placement
 
     gen, _ = engine.get_per_tensor_param_shard()
-    items = filter_tied_embeddings((name, (local, spec)) for name, local, spec in gen)
+    items = filter_tied_embeddings(
+        ((name, (local, spec)) for name, local, spec in gen), tie_word_embeddings=tie_word_embeddings
+    )
 
     named, shard_info = [], {}
     for name, (local, spec) in items:
@@ -272,6 +295,26 @@ def setup_raiden_controller() -> tuple[Any, Any, str]:
     return controller, server, address
 
 
+def raiden_is_tile_aligned(local_shape: list) -> bool:
+    """True when a 2D+ shard matches the TPU (8, 128) tile, so it can skip the CPU (de)tiling pass."""
+    return (len(local_shape) >= 2) and (local_shape[-1] % 128 == 0) and (local_shape[-2] % 8 == 0)
+
+
+def apply_raiden_skip_tiling(ws, skip_tiling_plan: list) -> None:
+    """Set the per-tensor skip_tiling plan on a WeightSynchronizer (API name differs across tpu_sync builds)."""
+    if hasattr(ws, "test_only_set_skip_tiling"):
+        ws.test_only_set_skip_tiling(skip_tiling_plan)
+    elif hasattr(ws, "set_skip_tiling"):
+        ws.set_skip_tiling(skip_tiling_plan)
+
+
+def _as_bool(value) -> bool:
+    """Parse a bool flag that may arrive as a string (env var, CLI override) as well as a bool."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 @CheckpointEngineRegistry.register("raiden")
 class RaidenCheckpointEngine(CheckpointEngine):
     """P2P Weight Synchronizer Checkpoint Engine for TPUs using Google Raiden (tpu-sync)."""
@@ -293,6 +336,21 @@ class RaidenCheckpointEngine(CheckpointEngine):
         self._registered_signature = None
         self._bound_tensors = None
         self._shard_info = {}
+        # Free the device tensors bound for a transfer, and the WeightSynchronizer that references them, once
+        # the controller push has read them, instead of keeping them until the next sync. With the local-shard
+        # export that is the bf16 copy of this rank's shards plus the full q/k/v, which the fused-wqkv save hook
+        # still all-gathers to every rank: ~3.4 GiB per chip for Qwen3-8B on 8 chips (~1.7 GiB of shards plus
+        # ~1.7 GiB of q/k/v, see get_per_tensor_param_shard). With an all-gathered weights iterable it is the
+        # full bf16 model on every chip. The synchronizer pins the device buffers of every bound tensor
+        # (dropping the Python references frees nothing), and tpu_sync has no unbind, so destroying it is the
+        # only way to return that HBM before the next sync, which then re-creates and re-registers the
+        # synchronizer instead of rebinding it. On by default so the trainer keeps that headroom as models grow;
+        # opt out with the engine kwarg or VERL_RAIDEN_RELEASE_BUFFERS=0 to trade HBM for the cheaper rebind.
+        release = _as_bool(kwargs.get("release_buffers_after_sync", True))
+        env_release = os.environ.get("VERL_RAIDEN_RELEASE_BUFFERS", "")
+        if env_release:
+            release = _as_bool(env_release)
+        self.release_buffers_after_sync = release
         if torch.distributed.is_initialized():
             self.rank = torch.distributed.get_rank()
         else:
@@ -450,6 +508,7 @@ class RaidenCheckpointEngine(CheckpointEngine):
         global_steps: Optional[int] = None,
         compute_stats: Optional[bool] = None,
         compute_checksum: Optional[bool] = None,
+        tie_word_embeddings: bool = True,
         **kwargs,
     ):
         """Register weights with RaidenController and prepare for coordinated P2P network transfer."""
@@ -468,9 +527,14 @@ class RaidenCheckpointEngine(CheckpointEngine):
 
         if hasattr(weights, "get_per_tensor_param_shard"):
             # Handed the training engine: register each rank's local FSDP shard, no all-gather.
-            named_weights, self._shard_info = export_local_shards(weights)
+            hf_config = getattr(getattr(weights, "model_config", None), "hf_config", None)
+            tie_word_embeddings = bool(getattr(hf_config, "tie_word_embeddings", tie_word_embeddings))
+            named_weights, self._shard_info = export_local_shards(weights, tie_word_embeddings=tie_word_embeddings)
         else:
-            named_weights = filter_tied_embeddings(weights.items() if hasattr(weights, "items") else weights)
+            named_weights = filter_tied_embeddings(
+                weights.items() if hasattr(weights, "items") else weights,
+                tie_word_embeddings=tie_word_embeddings,
+            )
             self._shard_info = {}
 
         # Trainer sends pure canonical un-fused model weights directly
@@ -484,16 +548,16 @@ class RaidenCheckpointEngine(CheckpointEngine):
         # Reuse the WeightSynchronizer across steps when the tensor signature is unchanged: rebinding keeps
         # the DMA-mapped host buffers, listener/threads, and controller registration, and only swaps the
         # device buffers the D2H reads from. Rebuilding every step re-allocates, pins, and first-touches
-        # a model-sized host buffer per rank (~1s/step at 0.6B). Rebuild only on first use or if the
-        # (name, shape, dtype, shard) signature changes.
+        # a model-sized host buffer per rank (~1s/step at 0.6B). Rebuild only on first use, if the
+        # (name, shape, dtype, shard) signature changes, or after release_sync_buffers() dropped it.
         signature = [(name, tuple(t.shape), t.dtype, self._shard_info.get(name)) for name, t in valid_weights]
         if self._trainer_raiden_ws is not None and signature == self._registered_signature:
             self._trainer_raiden_ws.bind_weights([[t] for _, t in valid_weights])
         else:
             await self._create_and_register(valid_weights)
             self._registered_signature = signature
-        # Keep the bound device buffers alive until the next sync: the controller-driven push reads them
-        # after send_weights returns.
+        # Keep the bound device buffers alive until the next sync (or release_sync_buffers()): the
+        # controller-driven push reads them after send_weights returns.
         self._bound_tensors = [t for _, t in valid_weights]
 
         # No explicit ws.d2h() here: PushWeightsResharded (triggered by the controller's start_transfer)
@@ -524,6 +588,46 @@ class RaidenCheckpointEngine(CheckpointEngine):
             )
         except Exception as e:
             logger.warning(f"Failed to record trainer rank {self.rank} stats in TPUWeightRegistry: {e}")
+
+    def release_sync_buffers(self) -> dict:
+        """Free this rank's bound send tensors and the WeightSynchronizer that references them.
+
+        Must only be called after the controller transfer that reads them has completed. Runs by default; a
+        no-op when release_buffers_after_sync is disabled, in which case the synchronizer and its bound tensors
+        are kept and rebound on the next sync. After a release, the next send_weights re-creates and
+        re-registers it.
+
+        TODO(tpu): Find a way to rebind on every step while still freeing the HBM between syncs, so the
+        synchronizer, its DMA-mapped host buffers and the controller registration are reused instead of being
+        torn down and rebuilt each sync. The synchronizer pins every bound device buffer, and bind_weights
+        only accepts same-size tensors (placeholders are rejected), so this needs a tpu_sync API to unbind or
+        drop the device buffers while keeping the rest.
+        Releasing every step costs sync latency, which we need to bring down. On Qwen3-8B (FSDP8 -> TP8, v6e-8
+        x2) a ~5 s end-to-end sync spends ~1.6-2.0 s in this release (the orchestrator waits for it after the
+        ~0.13 s sampler H2D, so it delays resuming generation) and ~2 s in "Trainer Raiden Init", which now
+        re-creates the synchronizer (allocating and pinning host buffers) and re-registers with the
+        controller on every sync. The transfer itself is ~0.9 s. Both costs grow with model size.
+        """
+        if not self.release_buffers_after_sync or self._trainer_raiden_ws is None:
+            return {}
+        # The torch WeightSynchronizer has no close(); the C++ object (which holds references to the
+        # device tensors and the host staging memory) is destroyed when the last Python reference goes.
+        ws, self._trainer_raiden_ws = self._trainer_raiden_ws, None
+        self._bound_tensors = None
+        self._registered_signature = None
+        del ws
+        import gc
+
+        gc.collect()
+        # No empty_cache(): on TPU it clears the eager-op compilation cache (forcing recompiles) and the
+        # TPU runtime reuses freed HBM without it.
+        try:
+            from torch_tpu._internal import sync as torch_tpu_sync
+
+            torch_tpu_sync.synchronize(wait=True)
+        except Exception:
+            pass
+        return {}
 
     @torch.no_grad()
     def receive_weights(self, global_steps: Optional[int] = None, **kwargs):
@@ -649,6 +753,12 @@ async def update_raiden_weights(
     await transfer_future.wait()
     t_transfer = time.perf_counter() - t_transfer_start
 
+    # The trainer buffers are no longer read once the transfer is done; free them (unless disabled)
+    # while the samplers install, so the HBM is back before the next training step.
+    release_refs = None
+    if hasattr(manager.actor_wg, "release_raiden_sync_buffers"):
+        release_refs = manager.actor_wg.release_raiden_sync_buffers()
+
     # 5. Sampler replicas install received weights to TPU HBM via H2D DMA
     t_install_start = time.perf_counter()
     install_futures = [
@@ -656,6 +766,14 @@ async def update_raiden_weights(
     ]
     await asyncio.gather(*install_futures)
     t_install = time.perf_counter() - t_install_start
+    # Tag new generations with this weight version (the trajectory staleness metrics read it), as the other
+    # checkpoint backends do once the new weights are loaded.
+    if global_steps is not None:
+        await asyncio.gather(
+            *[replica.server_handle.set_global_steps.remote(global_steps) for replica in manager.replicas]
+        )
+    if release_refs is not None:
+        await asyncio.to_thread(ray.get, release_refs)
 
     t_total = time.perf_counter() - t_total_start
 
