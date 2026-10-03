@@ -377,14 +377,19 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         return True
 
     @torch.no_grad()
-    def install_raiden_weights(self) -> int:
+    def install_raiden_weights(self) -> dict[str, float]:
         """Install received weights from host staging buffer into TPU HBM via zero-copy H2D DMA
-        and fuse/transpose them directly into vLLM model parameters."""
+        and fuse/transpose them directly into vLLM model parameters.
+
+        Returns:
+            Per-worker timings in seconds: ``total`` (whole install), ``h2d`` (pure ``_raiden_ws.h2d()``)
+            and ``sync`` (final TPU sync barrier). Empty if the synchronizer is not initialized.
+        """
         if not hasattr(self, "_raiden_ws") or self._raiden_ws is None:
             logging.getLogger(__name__).warning(
                 "Raiden Sampler: install_raiden_weights called before _raiden_ws was initialized."
             )
-            return 0
+            return {}
 
         t_start = time.perf_counter()
         t_h2d_start = time.perf_counter()
@@ -512,7 +517,8 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             f"[RAIDEN TELEMETRY | Sampler Worker] install_raiden_weights completed in {t_total:.4f}s "
             f"(H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
         )
-        return 1
+        # Returned through collective_rpc so the orchestrator can log them as step metrics.
+        return {"total": t_total, "h2d": t_h2d, "sync": t_sync}
 
     def get_model_weights_stats(self, include_shards: bool = False) -> dict:
         """Computes deterministic parameter count, L1 norm, and L2 norm across all model parameters.

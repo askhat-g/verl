@@ -764,8 +764,14 @@ async def update_raiden_weights(
     install_futures = [
         replica.server_handle.collective_rpc.remote(method="install_raiden_weights") for replica in manager.replicas
     ]
-    await asyncio.gather(*install_futures)
+    install_results = await asyncio.gather(*install_futures)
     t_install = time.perf_counter() - t_install_start
+    # collective_rpc returns one result per TP worker of each replica; each is the timing dict returned by
+    # vLLMRaidenWorkerExtension.install_raiden_weights. The slowest worker gates the sync, so report the max.
+    worker_install_stats = [
+        r for per_replica in install_results for r in (per_replica or []) if isinstance(r, dict) and "h2d" in r
+    ]
+    t_h2d_pure = max((r["h2d"] for r in worker_install_stats), default=None)
     # Tag new generations with this weight version (the trajectory staleness metrics read it), as the other
     # checkpoint backends do once the new weights are loaded.
     if global_steps is not None:
@@ -798,7 +804,23 @@ async def update_raiden_weights(
     # 6. Resume generation immediately
     await manager.resume_generation_replicas()
 
-    return {}
+    # Surface the phase timers as step metrics. The trainer stashes this dict in _pending_sync_metrics and
+    # merges it into the same step's metrics, so they are logged next to timing_s/update_weights by every
+    # configured backend (console / tensorboard / wandb). timing_s/update_weights ~= quiesce + total_sync.
+    metrics = {
+        "timing_s/tpu-sync/quiesce": t_abort,
+        "timing_s/tpu-sync/trainer_init": t_init_trainer,
+        "timing_s/tpu-sync/sampler_init": t_init_sampler,
+        "timing_s/tpu-sync/barrier": t_barrier,
+        "timing_s/tpu-sync/p2p_transfer": t_transfer,
+        "timing_s/tpu-sync/sampler_h2d": t_install,
+        "timing_s/tpu-sync/total_sync": t_total,
+    }
+    if t_h2d_pure is not None:
+        # Pure _raiden_ws.h2d() time on the slowest sampler worker (sampler_h2d above also includes the
+        # fuse/transpose into vLLM params, the TPU sync barrier and the RPC round trip).
+        metrics["timing_s/tpu-sync/sampler_h2d_pure"] = t_h2d_pure
+    return metrics
 
 
 async def _verify_parity_async(manager, global_steps: Optional[int] = None) -> None:
