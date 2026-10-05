@@ -36,7 +36,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint import CheckpointHandler, OrchestrationMode
 from verl.utils.dataset.dataset_utils import SFTTensorCollator
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
-from verl.utils.device import auto_set_device, get_device_name
+from verl.utils.device import auto_set_device, get_device_name, is_device_available
 from verl.utils.logger import log_with_rank
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions
 from verl.utils.tracking import Tracking
@@ -344,9 +344,8 @@ class SFTTrainer:
                 metrics["train/grad_norm"] = metrics.pop("grad_norm")
                 metrics["train/lr"] = metrics.pop("lr")
                 metrics["train/mfu"] = metrics.pop("mfu")
-                if self.device_name == "tpu":
-                    # On TPU clusters, the Ray driver runs on a CPU-only head node with no TPU device,
-                    # so allocating a tensor with device="tpu" on the driver fails.
+                if not is_device_available():
+                    # When the Ray driver runs on a CPU-only head node, no accelerator device is available locally.
                     metrics["train/global_tokens"] = sum(batch_seqlens)
                 else:
                     metrics["train/global_tokens"] = torch.sum(
@@ -376,8 +375,8 @@ class SFTTrainer:
                         else:
                             val_losses.append(metrics["loss"])
 
-                    if self.device_name == "tpu":
-                        # The Ray driver runs on a CPU-only head node where device="tpu" is unavailable.
+                    if not is_device_available():
+                        # The Ray driver may run on a CPU-only head node where the target accelerator is unavailable.
                         val_loss = torch.mean(torch.tensor(val_losses, dtype=torch.float32))
                     else:
                         val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
