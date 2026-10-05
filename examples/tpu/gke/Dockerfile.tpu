@@ -18,6 +18,10 @@ RUN pip uninstall -y torch torchvision || true
 RUN pip install --upgrade pip uv keyrings.google-artifactregistry-auth pandas==2.3.3
 
 ARG AUTH_TOKEN
+
+ARG TORCH_TPU_VERSION=0.1.1+release.2026.9.22.20260927223741
+ARG TPU_SYNC_VERSION=0.0.1.dev20261001132139
+
 # Use PIP_EXTRA_INDEX_URL so PyPI remains the primary index for standard packages like JAX
 ENV PIP_EXTRA_INDEX_URL="https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
@@ -32,8 +36,8 @@ RUN pip install torchvision==0.28.0 --index-url https://download.pytorch.org/whl
 RUN pip install libtpu==0.0.47 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
 RUN pip install --pre --no-deps \
-    "torch-tpu==0.1.1.dev20260912075415" \
-    "tpu-sync-torch==0.0.1.dev20260927082445" \
+    "torch-tpu==${TORCH_TPU_VERSION}" \
+    "tpu-sync-torch==${TPU_SYNC_VERSION}" \
     --index-url "https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
 RUN pip install 'typeguard==2.13.3'
@@ -95,8 +99,8 @@ RUN pip install --no-cache-dir \
 # Re-verify and lock exact PyTorch / TorchTPU / JAX / libtpu / Transformers versions after all dependency resolvers run
 RUN pip install --no-deps torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu && \
     pip install --pre --no-deps \
-    "torch-tpu==0.1.1.dev20260912075415" \
-    "tpu-sync-torch==0.0.1.dev20260927082445" \
+    "torch-tpu==${TORCH_TPU_VERSION}" \
+    "tpu-sync-torch==${TPU_SYNC_VERSION}" \
     --index-url "https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" && \
     pip install --no-deps \
     "jax==0.10.2" \
@@ -107,52 +111,12 @@ RUN pip install --no-deps torch==2.13.0 torchvision==0.28.0 --index-url https://
     "fastapi<0.137" \
     -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
-# (a) Why needed: Bake into the container image:
-#     1. ray-project/ray#66400 fix in ray/_private/worker.py so multi-host TPU slices
-#        with global TPU_VISIBLE_CHIPS (e.g. 12,13,14,15 on 4-host v6e-16) do not raise
-#        IndexError in get_assigned_accelerator_ids.
-#     2. PyTorch 2.13 FSDP2 finalize_backward fix in _fsdp_param_group.py so TPU stream
-#        events wait on self.device_handle.current_stream() instead of torch.accelerator.
-#     3. verl.pth and PYTHONPATH entries for /workspace/verl and /data/verl so spawned
-#        RayWorkerWrapper processes always resolve verl without runtime site-packages patching.
-# (b) Strictly necessary or cluster-configurable? Baking these into Dockerfile.tpu makes
-#     the runtime patches in prepare_tpu_env.py / bootstrap.py a no-op on updated images.
-# (c) Why smaller models (0.6B, 4B) didn't require it: 0.6B/4B run on 2-host v6e-8 slices
-#     where TPU_VISIBLE_CHIPS indices happen to be <8.
-RUN python3 - <<'PY'
-from pathlib import Path
-import ray
-import torch
-
-site_packages = Path(ray.__file__).resolve().parent
-worker_path = site_packages / "_private" / "worker.py"
-old_w = """        if self.original_visible_accelerator_ids.get(resource_name, None) is not None:
-            original_ids = self.original_visible_accelerator_ids[resource_name]
-            assigned_ids = {str(original_ids[i]) for i in assigned_ids}
-        return list(assigned_ids)"""
-new_w = """        if self.original_visible_accelerator_ids.get(resource_name, None) is not None:
-            original_ids = self.original_visible_accelerator_ids[resource_name]
-            if all(i < len(original_ids) for i in assigned_ids):
-                assigned_ids = {str(original_ids[i]) for i in assigned_ids}
-            else:
-                assigned_ids = {str(x) for x in original_ids[: len(assigned_ids)]}
-        return list(assigned_ids)"""
-w_txt = worker_path.read_text()
-if old_w in w_txt:
-    worker_path.write_text(w_txt.replace(old_w, new_w, 1))
-
-fsdp_pg_path = (
-    Path(torch.__file__).resolve().parent / "distributed" / "fsdp" / "_fully_shard" / "_fsdp_param_group.py"
-)
-if fsdp_pg_path.is_file():
-    pg_txt = fsdp_pg_path.read_text()
-    bad_line = "torch.accelerator.current_stream().wait_event(event)"
-    good_line = "self.device_handle.current_stream().wait_event(event)"
-    if bad_line in pg_txt:
-        fsdp_pg_path.write_text(pg_txt.replace(bad_line, good_line))
-
-(site_packages.parent / "verl.pth").write_text("/workspace/verl\n/data/verl\n")
-PY
+# Fail the build if the installed torch / torch_tpu / tpu-sync drifted from the pinned pair above.
+RUN python -c "import importlib.metadata as m, sys; \
+want = {'torch': '2.13.0+cpu', 'torch-tpu': '${TORCH_TPU_VERSION}', 'tpu-sync-torch': '${TPU_SYNC_VERSION}'}; \
+got = {k: m.version(k) for k in want}; \
+print('Pinned torch / torch_tpu / tpu-sync:', got); \
+sys.exit(0 if got == want else f'Version drift: want {want}, got {got}')"
 
 WORKDIR /app
 

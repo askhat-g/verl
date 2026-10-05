@@ -851,6 +851,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.base_sync_done = True
         set_expandable_segments(True)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def release_raiden_sync_buffers(self):
+        """Free the Raiden send buffers after the P2P transfer (default; no-op if release_buffers_after_sync=False)."""
+        release = getattr(getattr(self, "checkpoint_engine", None), "release_sync_buffers", None)
+        if release is None:
+            return {}
+        return release() or {}
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
         """Execute checkpoint engine method.

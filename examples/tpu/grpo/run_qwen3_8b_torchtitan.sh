@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# GRPO | Qwen3-8B | GSM8K | TorchTitan Training & vLLM Rollout | TPU v6e-8 x2 Slices
-# V1 PPOTrainer (Separate Async Overlap)
+# GRPO | Qwen3-8B | GSM8K | TorchTitan Training (SimpleFSDP, torch.compile + splash attention, DEFER_AND_FUSE) & vLLM Rollout | TPU v6e-8 x2 Slices
+# V1 PPOTrainer (Separate Async Overlap), Raiden weight sync.
 #
-# By default this runs a 100-step GRPO job. Set SMOKE_TEST=1 for the 5-step
-# configuration used to validate that the stack comes up.
+# Mirrors run_qwen3_4b_torchtitan.sh so weight-sync timings are directly comparable.
+# With rollout TP=8, every large Qwen3-8B tensor is TPU tile-aligned
+# (e.g. down_proj per rank = [4096, 12288 / 8 = 1536], 1536 % 128 == 0), so Raiden
+# should never fall back to CPU TileBuffer() during Sampler H2D.
 
 set -xeuo pipefail
 
@@ -13,61 +15,91 @@ export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VLLM_USE_V1=0
 export RAY_memory_monitor_refresh_ms=0
 export RAY_memory_usage_threshold=0.99
+
+# JAX/XLA Launch Barrier Configuration
 export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false"
 
-SMOKE_TEST="${SMOKE_TEST:-0}"
+# PyTorch Dynamo / Compile Logging and Recompile Limits
+export TORCH_LOGS="${TORCH_LOGS:-recompiles}"
+export TORCH_DYNAMO_RECOMPILE_LIMIT="${TORCH_DYNAMO_RECOMPILE_LIMIT:-64}"
 
-if [[ "${SMOKE_TEST}" == "1" ]]; then
-    exp_name="${EXPERIMENT_NAME:-qwen3_8b_fast_smoke_test}"
-    TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
-    VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-4}"
-    VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-8}"
-    PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-4}"
-    ROLLOUT_N="${ROLLOUT_N:-2}"
-    MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-512}"
-    MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
-    TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-5}"
-    TEST_FREQ="${TEST_FREQ:-2}"
-    VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
-else
-    exp_name="${EXPERIMENT_NAME:-qwen3_8b_gsm8k}"
-    TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
-    VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-32}"
-    VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-64}"
-    PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
-    ROLLOUT_N="${ROLLOUT_N:-4}"
-    MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1024}"
-    MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
-    TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-100}"
-    TEST_FREQ="${TEST_FREQ:-10}"
-    VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
-fi
+exp_name="${EXPERIMENT_NAME:-qwen3_8b_gsm8k_fsdp_compile}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-64}"
+VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-128}"
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
+ROLLOUT_N="${ROLLOUT_N:-8}"
+MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1024}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
+TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-3}"
+# Free the bf16 tensors Raiden sends from and the WeightSynchronizer pinning them after each transfer, so they
+# do not stay resident through training until the next sync. For 8B on 8 chips that is ~3.4 GiB/chip: ~1.7 GiB
+# of local shards plus ~1.7 GiB of full q/k/v, which torchtitan's fused-wqkv save hook still all-gathers.
+# This is the engine default; set False to keep and rebind them instead (faster init, more HBM).
+RELEASE_SYNC_BUFFERS="${RELEASE_SYNC_BUFFERS:-True}"
+# Full AC, as in torchtitan's qwen3-8b v6e-8 recipe (selective AC OOMs on v6e).
+ACTIVATION_CHECKPOINT="${ACTIVATION_CHECKPOINT:-full}"
+# SimpleFSDP: the FSDP all-gather/reduce-scatter are traced into each compiled TransformerBlock instead of running
+# from FSDP2 hooks. Compared with FSDP2 (which fills HBM in update_actor, with the TPU runtime constantly unloading
+# and reloading programs), it lowers the update_actor tensor peak by ~3.7 GiB per chip and runs update_actor ~6x
+# faster. FSDP2 (False) is not supported for 8B on 8 chips: update_actor runs out of HBM.
+USE_SIMPLE_FSDP="${USE_SIMPLE_FSDP:-True}"
+# torch_tpu eager mode for the ops outside the compiled blocks (LM head, log-prob/loss, grad clipping, optimizer):
+# DEFER_AND_FUSE fuses them into larger XLA programs; null keeps torch_tpu's default of one program per op. Even
+# without the reference model, null raises the update_actor tensor peak to ~31.2 GiB per chip at 8B, at the limit.
+# DEFER_AND_FUSE's programs keep ~3.5 GiB of scratch reserved between steps, which the TPU runtime gives back when
+# memory is tight.
+TPU_EAGER_MODE="${TPU_EAGER_MODE:-DEFER_AND_FUSE}"
+# KL-to-reference loss, off by default. The reference model keeps a second copy of the weights on every trainer
+# chip (fp32, ~3.9 GiB per chip at 8B on 8 chips; parameter offload is not available for it on TPU), leaving only
+# ~0.5 GiB at the update_actor peak. Set True to enable it.
+USE_KL_LOSS="${USE_KL_LOSS:-False}"
+# Per-micro-batch token budget for training and log-prob passes. Logits ([tokens, 151936]) and
+# attention scale with it, so 2048 keeps one micro-batch well inside HBM (torchtitan's v6e-8 recipe
+# trains at seq_len 2048). Must stay >= MAX_MODEL_LEN.
+MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-2048}"
+TEST_FREQ="${TEST_FREQ:-10}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
 
-# Ensure GSM8K dataset and Qwen/Qwen3-8B checkpoint are present on all nodes (and evict any other model)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-python3 "${SCRIPT_DIR}/prepare_tpu_env.py" "Qwen/Qwen3-8B"
-
+# Project details
 project_name='verl_tpu_grpo'
-RAY_DATA_HOME="/data/jialei"
+
+# Paths
+RAY_DATA_HOME="${RAY_DATA_HOME:-/data/jialei}"
 MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-8B}"
-TRAIN_FILE="${TRAIN_FILE:-${RAY_DATA_HOME}/data/gsm8k/train.parquet}"
-TEST_FILE="${TEST_FILE:-${RAY_DATA_HOME}/data/gsm8k/test.parquet}"
 
-export NNODES_TRAINER="${NNODES_TRAINER:-2}"
-export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-4}"
-export NNODES_ROLLOUT="${NNODES_ROLLOUT:-2}"
-export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-4}"
+TRAIN_FILE="${RAY_DATA_HOME}/data/gsm8k/train.parquet"
+TEST_FILE="${RAY_DATA_HOME}/data/gsm8k/test.parquet"
 
-TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
+# TPU 2-slice v6e-8 configurations
+export NNODES_TRAINER=2       # 2 physical VM hosts for training slice
+export N_CHIPS_TRAINER=4      # 4 TPU chips per training host
+
+export NNODES_ROLLOUT=2       # 2 physical VM hosts for rollout slice
+export N_CHIPS_ROLLOUT=4      # 4 TPU chips per rollout host
+
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
+TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
+
+# Sequence budget
 MAX_PROMPT_LEN=512
 MAX_MODEL_LEN=$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))
 
+# Actor parallelism (default: Full FSDP across all 8 trainer chips: tp=1, dp_shard=8)
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
-DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${TOTAL_TRAINER_CHIPS}}"
+DEFAULT_DP_SHARD=$((TOTAL_TRAINER_CHIPS / TENSOR_PARALLEL_SIZE))
+DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}"
 
+# Off-policy correction (truncated importance sampling). Required in the decoupled
+# separate_async regime; see run_qwen3_0_6b_torchtitan.sh for the full derivation.
 ROLLOUT_IS="${ROLLOUT_IS:-token}"
 ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
+
+# TorchTitan trainer: per-TransformerBlock torch.compile(backend="tpu") with the splash attention Pallas
+# kernel. Compile on TPU requires splash (compiled SDPA yields NaN gradients on torch_tpu), and with splash
+# the trainer builds no dense [seq, seq] attention mask. By default the FSDP collectives run inside the compiled
+# blocks (USE_SIMPLE_FSDP) and the eager ops between them are fused (TPU_EAGER_MODE=DEFER_AND_FUSE), as in
+# run_qwen3_4b_torchtitan.sh. The reference model inherits these settings from the actor.
 
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
@@ -87,8 +119,8 @@ python3 -m verl.trainer.main_ppo \
     data.val_max_samples="${VAL_MAX_SAMPLES}" \
     data.max_prompt_length="${MAX_PROMPT_LEN}" \
     data.max_response_length="${MAX_RESPONSE_LEN}" \
-    +data.max_length=2048 \
-    +data.max_token_len_per_gpu=2048 \
+    +data.max_length=4096 \
+    +data.max_token_len_per_gpu=4096 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     +data.pad_mode=no_padding \
@@ -96,25 +128,29 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.use_torch_compile=False \
-    actor_rollout_ref.actor.torchtitan.use_torch_compile=False \
+    actor_rollout_ref.actor.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_splash_attention=True \
+    actor_rollout_ref.actor.torchtitan.use_simple_fsdp="${USE_SIMPLE_FSDP}" \
+    actor_rollout_ref.actor.torchtitan.tpu_eager_mode="${TPU_EAGER_MODE}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=2048 \
-    actor_rollout_ref.actor.use_kl_loss=False \
-    actor_rollout_ref.actor.kl_loss_coef=0.0 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_GPU}" \
+    actor_rollout_ref.actor.use_kl_loss="${USE_KL_LOSS}" \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.actor.torchtitan.activation_checkpoint=full \
-    actor_rollout_ref.actor.torchtitan.entropy_from_logits_with_chunking=True \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_GPU}" \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.torchtitan.tensor_parallel_size="${TENSOR_PARALLEL_SIZE}" \
     actor_rollout_ref.actor.torchtitan.data_parallel_shard_size="${DATA_PARALLEL_SHARD_SIZE}" \
     actor_rollout_ref.actor.torchtitan.pipeline_parallel_size=1 \
     actor_rollout_ref.actor.torchtitan.attn_type=varlen \
+    actor_rollout_ref.actor.torchtitan.activation_checkpoint="${ACTIVATION_CHECKPOINT}" \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${TOTAL_ROLLOUT_CHIPS}" \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
@@ -122,8 +158,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.dtype=bfloat16 \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=2048 \
-    actor_rollout_ref.rollout.checkpoint_engine.backend=tpu \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_GPU}" \
+    actor_rollout_ref.rollout.checkpoint_engine.backend=raiden \
+    +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.release_buffers_after_sync="${RELEASE_SYNC_BUFFERS}" \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \
