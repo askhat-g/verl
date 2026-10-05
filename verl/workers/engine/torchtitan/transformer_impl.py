@@ -776,34 +776,6 @@ class TorchTitanEngine(BaseEngine):
                 for e, (hf_name, _shape) in enumerate(slots):
                     yield hf_name, full[e].clone()
                 del full
-            # (a) Why needed: torch_tpu executes lazily; after get_per_tensor_param() all-gathers FSDP2
-            #     shards (or when EngineEvalModeCtx / EngineTrainModeCtx exits), unsharded buffers and
-            #     pending HLO graphs can remain allocated in TPU HBM unless explicitly resharded and
-            #     synchronized before the next phase.
-            # (b) Strictly necessary or fixable another way?: Necessary when using TPUCheckpointEngine
-            #     (checkpoint_engine.backend=naive). Switching to checkpoint_engine.backend=raiden
-            #     (consumes_training_engine=True) exports local FSDP shards directly without calling
-            #     get_per_tensor_param(), avoiding the trainer-side all-gather during weight sync.
-            # (c) Why smaller models (0.6B, 4B) didn't require it: Holding an unsharded copy of 0.6B
-            #     (1.2 GB) or 4B (8 GB) in HBM alongside training states fits within 32 GB/chip, whereas
-            #     32B (64 GB in bf16) overflows HBM if unsharded buffers linger.
-            if self.engine_config.data_parallel_shard_size > 1:
-                from torch.distributed.fsdp import FSDPModule
-
-                for module in self.module:
-                    for submodule in module.modules():
-                        if isinstance(submodule, FSDPModule):
-                            submodule.reshard()
-            try:
-                import gc
-
-                import torch_tpu
-
-                gc.collect()
-                torch_tpu._internal.sync.synchronize(wait=True)
-            except Exception:
-                pass
-            get_platform().empty_cache()
 
         # TODO: support Torchtitan PEFT
         return _gen(), None
@@ -834,17 +806,6 @@ class EngineEvalModeCtx(BaseEngineCtx):
                         submodule.reshard()
 
         super().__exit__(exc_type, exc_value, traceback)
-        # Flush lazy torch_tpu HLO graphs and release unsharded eval buffers before training step
-        try:
-            import gc
-
-            import torch_tpu
-
-            gc.collect()
-            torch_tpu._internal.sync.synchronize(wait=True)
-        except Exception:
-            pass
-        get_platform().empty_cache()
 
 
 class EngineTrainModeCtx(BaseEngineCtx):
@@ -861,25 +822,7 @@ class EngineTrainModeCtx(BaseEngineCtx):
         assert isinstance(self.engine, TorchTitanEngine)
         if self.zero_grad_on_exit or exc_type is not None:
             self.engine.optimizer_zero_grad()
-        # Reshard every FSDP2 module and flush lazy torch_tpu buffers before weight sync
-        if self.engine.engine_config.data_parallel_shard_size > 1:
-            from torch.distributed.fsdp import FSDPModule
-
-            for module in self.engine.module:
-                for submodule in module.modules():
-                    if isinstance(submodule, FSDPModule):
-                        submodule.reshard()
         super().__exit__(exc_type, exc_value, traceback)
-        try:
-            import gc
-
-            import torch_tpu
-
-            gc.collect()
-            torch_tpu._internal.sync.synchronize(wait=True)
-        except Exception:
-            pass
-        get_platform().empty_cache()
 
 
 @EngineRegistry.register(model_type="language_model", backend=["torchtitan"], device=["cuda", "npu", "tpu"])
