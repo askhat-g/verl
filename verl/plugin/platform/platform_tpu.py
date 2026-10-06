@@ -64,8 +64,12 @@ TPU_TOPOLOGY_MAP = {
     1: "1,1,1",
 }
 
-# TPU 7x (Ironwood) 4D mesh topology mappings (X, Y, Z, CoresPerChip=2)
+# TPU 7x (Ironwood) 4D mesh topology mappings (X, Y, Z, CoresPerChip=2), keyed by device count.
+# A host has 4 chips (2x2x1) and 8 devices; the multi-host entries follow the GKE slice shapes
+# (2x2x2 = 2 hosts, 2x2x4 = 4, 2x4x4 = 8, 4x4x4 = 16).
 TPU_V7X_TOPOLOGY_MAP = {
+    128: "4,4,4,2",
+    64: "2,4,4,2",
     32: "2,2,4,2",
     16: "2,2,2,2",
     8: "2,2,1,2",
@@ -400,7 +404,18 @@ class PlatformTPU(PlatformCUDA):
         tpu_type = tpu_nodes[0].get("Labels", {}).get("ray.io/tpu-pod-type", "") if tpu_nodes else ""
 
         topo_map = get_tpu_topology_map()
-        topo = topo_map.get(tpu_type) or topo_map.get(world_size, topo_map[1])
+        topo = topo_map.get(tpu_type) or topo_map.get(world_size)
+        if topo is None:
+            # Falling back to the single-device topology makes a multi-host trainer fail in ways that do not
+            # point here (the mesh forms, then collectives stall or halt), so say what happened.
+            logger.warning(
+                "No TPU topology entry for pod type %r or %d devices; falling back to %r. "
+                "Add the slice shape to the topology map.",
+                tpu_type,
+                world_size,
+                topo_map[1],
+            )
+            topo = topo_map[1]
         chips_bounds = topo_map[1]
 
         env_vars.update(

@@ -7,6 +7,7 @@ The training setup uses:
 - **Rollout Engine**: vLLM (`actor_rollout_ref.rollout.name=vllm`)
 - **Placement Strategy**: Non-colocated multi-slice execution (Slice 0 for Trainer/Actor, Slice 1 for Rollout)
 - **TPU 7x (`2x2x1` Single-Host Topology)**: Each `2x2x1` host (`numOfHosts: 1`) provides 4 physical dual-core chips = 8 addressable TensorCore devices (`NNODES=1`, `N_CHIPS=8`, 4D mesh topology `2,2,1,2`).
+- **Multi-host trainer slices on TPU 7x**: the trainer slice can also be `2x2x2` (2 hosts, 16 devices), `2x2x4` (4 hosts, 32 devices), `2x4x4` (8 hosts, 64 devices) or `4x4x4` (16 hosts, 128 devices). The 4D topology is looked up by device count in `TPU_V7X_TOPOLOGY_MAP` (`verl/plugin/platform/platform_tpu.py`); a shape missing from that table logs a warning and falls back to the single-device topology, which does not work for a multi-host trainer.
 
 ---
 
