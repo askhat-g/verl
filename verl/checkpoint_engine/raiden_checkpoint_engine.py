@@ -336,16 +336,16 @@ class RaidenCheckpointEngine(CheckpointEngine):
         self._registered_signature = None
         self._bound_tensors = None
         self._shard_info = {}
-        # Free the device tensors bound for a transfer, and the WeightSynchronizer that references them, once
-        # the controller push has read them, instead of keeping them until the next sync. With the local-shard
-        # export that is the bf16 copy of this rank's shards plus the full q/k/v, which the fused-wqkv save hook
-        # still all-gathers to every rank: ~3.4 GiB per chip for Qwen3-8B on 8 chips (~1.7 GiB of shards plus
-        # ~1.7 GiB of q/k/v, see get_per_tensor_param_shard). With an all-gathered weights iterable it is the
-        # full bf16 model on every chip. The synchronizer pins the device buffers of every bound tensor
-        # (dropping the Python references frees nothing), and tpu_sync has no unbind, so destroying it is the
-        # only way to return that HBM before the next sync, which then re-creates and re-registers the
-        # synchronizer instead of rebinding it. On by default so the trainer keeps that headroom as models grow;
-        # opt out with the engine kwarg or VERL_RAIDEN_RELEASE_BUFFERS=0 to trade HBM for the cheaper rebind.
+        # Free the device tensors bound for a transfer once the controller push has read them, instead of keeping
+        # them until the next sync. With the local-shard export that is the bf16 copy of this rank's shards plus
+        # the full q/k/v, which the fused-wqkv save hook still all-gathers to every rank: ~3.4 GiB per chip for
+        # Qwen3-8B on 8 chips (~1.7 GiB of shards plus ~1.7 GiB of q/k/v, see get_per_tensor_param_shard). With
+        # an all-gathered weights iterable it is the full bf16 model on every chip. The synchronizer pins the
+        # device buffers of every bound tensor (dropping the Python references frees nothing), so the release
+        # goes through WeightSynchronizer.unbind_weights(): the HBM holds are dropped while the synchronizer, its
+        # pinned host staging buffers and its controller registration stay alive for the next sync to rebind.
+        # On by default so the trainer keeps that headroom as models grow; opt out with the engine kwarg or
+        # VERL_RAIDEN_RELEASE_BUFFERS=0 to keep the send tensors resident between syncs.
         release = _as_bool(kwargs.get("release_buffers_after_sync", True))
         env_release = os.environ.get("VERL_RAIDEN_RELEASE_BUFFERS", "")
         if env_release:
@@ -547,9 +547,9 @@ class RaidenCheckpointEngine(CheckpointEngine):
 
         # Reuse the WeightSynchronizer across steps when the tensor signature is unchanged: rebinding keeps
         # the DMA-mapped host buffers, listener/threads, and controller registration, and only swaps the
-        # device buffers the D2H reads from. Rebuilding every step re-allocates, pins, and first-touches
-        # a model-sized host buffer per rank (~1s/step at 0.6B). Rebuild only on first use, if the
-        # (name, shape, dtype, shard) signature changes, or after release_sync_buffers() dropped it.
+        # device buffers the D2H reads from (release_sync_buffers() unbinds them between syncs). Rebuilding
+        # every step re-allocates, pins, and first-touches a model-sized host buffer per rank (~1s/step at
+        # 0.6B). Rebuild only on first use or if the (name, shape, dtype, shard) signature changes.
         signature = [(name, tuple(t.shape), t.dtype, self._shard_info.get(name)) for name, t in valid_weights]
         if self._trainer_raiden_ws is not None and signature == self._registered_signature:
             self._trainer_raiden_ws.bind_weights([[t] for _, t in valid_weights])
@@ -590,35 +590,23 @@ class RaidenCheckpointEngine(CheckpointEngine):
             logger.warning(f"Failed to record trainer rank {self.rank} stats in TPUWeightRegistry: {e}")
 
     def release_sync_buffers(self) -> dict:
-        """Free this rank's bound send tensors and the WeightSynchronizer that references them.
+        """Free this rank's bound send tensors while keeping the WeightSynchronizer for the next sync.
 
         Must only be called after the controller transfer that reads them has completed. Runs by default; a
-        no-op when release_buffers_after_sync is disabled, in which case the synchronizer and its bound tensors
-        are kept and rebound on the next sync. After a release, the next send_weights re-creates and
-        re-registers it.
+        no-op when release_buffers_after_sync is disabled, in which case the bound tensors stay resident
+        between syncs.
 
-        TODO(tpu): Find a way to rebind on every step while still freeing the HBM between syncs, so the
-        synchronizer, its DMA-mapped host buffers and the controller registration are reused instead of being
-        torn down and rebuilt each sync. The synchronizer pins every bound device buffer, and bind_weights
-        only accepts same-size tensors (placeholders are rejected), so this needs a tpu_sync API to unbind or
-        drop the device buffers while keeping the rest.
-        Releasing every step costs sync latency, which we need to bring down. On Qwen3-8B (FSDP8 -> TP8, v6e-8
-        x2) a ~5 s end-to-end sync spends ~1.6-2.0 s in this release (the orchestrator waits for it after the
-        ~0.13 s sampler H2D, so it delays resuming generation) and ~2 s in "Trainer Raiden Init", which now
-        re-creates the synchronizer (allocating and pinning host buffers) and re-registers with the
-        controller on every sync. The transfer itself is ~0.9 s. Both costs grow with model size.
+        WeightSynchronizer.unbind_weights() drops the synchronizer's holds on the bound device buffers, so
+        dropping our own references returns the HBM. The synchronizer itself, its pinned host staging buffers
+        and its controller registration survive, and D2H/H2D are rejected until the next send_weights rebinds
+        through bind_weights(). Compared to destroying and re-creating the synchronizer each sync, this removes
+        the per-step rebuild (host buffer allocation, pinning and first touch, plus controller
+        re-registration: ~2 s "Trainer init" + ~2 s release on Qwen3-8B, v6e-8) from the sync critical path.
         """
         if not self.release_buffers_after_sync or self._trainer_raiden_ws is None:
             return {}
-        # The torch WeightSynchronizer has no close(); the C++ object (which holds references to the
-        # device tensors and the host staging memory) is destroyed when the last Python reference goes.
-        ws, self._trainer_raiden_ws = self._trainer_raiden_ws, None
+        self._trainer_raiden_ws.unbind_weights()
         self._bound_tensors = None
-        self._registered_signature = None
-        del ws
-        import gc
-
-        gc.collect()
         # No empty_cache(): on TPU it clears the eager-op compilation cache (forcing recompiles) and the
         # TPU runtime reuses freed HBM without it.
         try:

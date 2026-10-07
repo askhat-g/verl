@@ -51,7 +51,7 @@ export RAY_NAMESPACE="${RAY_NAMESPACE:-default}"
 export KUEUE_QUEUE_PREFIX="${KUEUE_QUEUE_PREFIX:-verl-tpu-ci}"
 KUEUE_QUEUE=""
 TIER_NAME=""
-export TPU_CI_IMAGE="${TPU_CI_IMAGE:-us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260928-tsync0927}"
+export TPU_CI_IMAGE="${TPU_CI_IMAGE:-us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261006-tsync1006}"
 export SMOKE_TEST="${SMOKE_TEST:-1}"
 export PORT_FORWARD_PORT="${PORT_FORWARD_PORT:-$((28000 + RANDOM % 1000))}"
 # Maximum time to wait in the Kueue queue before giving up.

@@ -19,8 +19,8 @@ RUN pip install --upgrade pip uv keyrings.google-artifactregistry-auth pandas==2
 
 ARG AUTH_TOKEN
 
-ARG TORCH_TPU_VERSION=0.1.1+release.2026.9.22.20260927223741
-ARG TPU_SYNC_VERSION=0.0.1.dev20261001132139
+ARG TORCH_TPU_VERSION=0.1.2.dev20261006000518
+ARG TPU_SYNC_VERSION=0.0.1.dev20261006025601
 
 # Use PIP_EXTRA_INDEX_URL so PyPI remains the primary index for standard packages like JAX
 ENV PIP_EXTRA_INDEX_URL="https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
