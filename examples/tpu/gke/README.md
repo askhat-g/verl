@@ -38,6 +38,7 @@ The CI does **not** use the long-lived cluster above. It is split into tiers by 
 
 To add a test, write a `test_*` function in `run_tpu_e2e_ci.sh` (one Ray job, optionally with a verifier in [`tests/special_tpu/verify_tpu_e2e_log.py`](../../../tests/special_tpu/verify_tpu_e2e_log.py)) and call it from the matching tier in `run_tier`. Tests in a tier run one after another on the same RayCluster.
 
+- **Docker image**: pinned in [`tests/special_tpu/gke/tpu-ci-image.env`](../../../tests/special_tpu/gke/tpu-ci-image.env) (`TPU_CI_IMAGE`, built from [`Dockerfile.tpu`](Dockerfile.tpu)) and rendered into [`tests/special_tpu/gke/raycluster-ci.yaml`](../../../tests/special_tpu/gke/raycluster-ci.yaml) by `run_tpu_e2e_ci.sh`.
 - **Queueing**: each tier has its own Kueue queue ([`tests/special_tpu/gke/kueue-tpu-ci.yaml`](../../../tests/special_tpu/gke/kueue-tpu-ci.yaml)), and the tier's RayCluster ([`tests/special_tpu/gke/raycluster-ci.yaml`](../../../tests/special_tpu/gke/raycluster-ci.yaml)) is labelled `kueue.x-k8s.io/queue-name: verl-tpu-ci-<1chip|4chip|8chip>`. Kueue keeps the cluster suspended until its queue has enough free TPU quota, then admits the whole cluster at once (gang admission). Concurrent PRs therefore wait in first-come-first-served order per tier (`StrictFIFO`) instead of competing for hosts, and two runs can never deadlock holding half a cluster each.
 
   | Queue | TPU quota | Shares with |

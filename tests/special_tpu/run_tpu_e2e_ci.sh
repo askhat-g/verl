@@ -51,16 +51,21 @@ export RAY_NAMESPACE="${RAY_NAMESPACE:-default}"
 export KUEUE_QUEUE_PREFIX="${KUEUE_QUEUE_PREFIX:-verl-tpu-ci}"
 KUEUE_QUEUE=""
 TIER_NAME=""
-export TPU_CI_IMAGE="${TPU_CI_IMAGE:-us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261006-tsync1006}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${REPO_ROOT}"
+
+# Load default TPU_CI_IMAGE from tests/special_tpu/gke/tpu-ci-image.env unless overridden in env.
+if [[ -z "${TPU_CI_IMAGE:-}" ]]; then
+    # shellcheck source=tests/special_tpu/gke/tpu-ci-image.env
+    source "${REPO_ROOT}/tests/special_tpu/gke/tpu-ci-image.env"
+fi
+export TPU_CI_IMAGE
 export SMOKE_TEST="${SMOKE_TEST:-1}"
 export PORT_FORWARD_PORT="${PORT_FORWARD_PORT:-$((28000 + RANDOM % 1000))}"
 # Maximum time to wait in the Kueue queue before giving up.
 export QUEUE_TIMEOUT_MINS="${QUEUE_TIMEOUT_MINS:-120}"
 # CI RayClusters older than this are considered leaked (e.g. runner pod crashed) and reaped.
 export STALE_CLUSTER_SECONDS="${STALE_CLUSTER_SECONDS:-10800}"
-
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "${REPO_ROOT}"
 
 RUN_ID="${GITHUB_RUN_ID:-local$(date +%s)}"
 RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
