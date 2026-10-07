@@ -528,6 +528,18 @@ class PlatformTPU(PlatformCUDA):
             "VERL_PLATFORM": "tpu",
             "TPU_ACCELERATOR_TYPE": os.environ.get("TPU_ACCELERATOR_TYPE", "v6e"),
         }
+        for key in (
+            "WANDB_API_KEY",
+            "WANDB_BASE_URL",
+            "WANDB_ENTITY",
+            "WANDB_PROJECT",
+            "WANDB_MODE",
+            "VERL_FILE_LOGGER_ROOT",
+            "VERL_FILE_LOGGER_PATH",
+            "TENSORBOARD_DIR",
+        ):
+            if os.environ.get(key):
+                env_vars[key] = os.environ[key]
         return {
             "runtime_env": {
                 "worker_process_setup_hook": patch_ray_worker,
