@@ -30,7 +30,7 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
-from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config import CompileConfig, DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
@@ -216,6 +216,7 @@ class TorchTitanEngine(BaseEngine):
         )
         checkpoint = CheckpointManager.Config(
             enable=True,
+            interval=1,  # verl's trainer.save_freq controls when save_checkpoint is called.
             initial_load_in_hf=True,
             initial_load_model_only=True,
             initial_load_path=model_config.path,
@@ -227,6 +228,8 @@ class TorchTitanEngine(BaseEngine):
         )
 
         training_kwargs = {}
+        if total_steps > 0:
+            training_kwargs["steps"] = total_steps
         if self.engine_config.max_seq_len is not None:
             training_kwargs["seq_len"] = self.engine_config.max_seq_len
         if (self.engine_config.offload_policy or self.engine_config.forward_only) and device_name != "tpu":
@@ -247,6 +250,7 @@ class TorchTitanEngine(BaseEngine):
 
         # Construct Torchtitan's Trainer.Config
         self.config = Trainer.Config(
+            debug=DebugConfig(seed=self.engine_config.seed),
             model_spec=model_spec,
             hf_assets_path=self.model_config.path,
             optimizer=optimizer,

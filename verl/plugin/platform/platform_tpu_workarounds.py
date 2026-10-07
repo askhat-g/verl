@@ -188,10 +188,14 @@ def get_platform_worker_env_vars(
     env_vars = {}
     if "VERL_PLATFORM" in os.environ:
         env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
-    for var in get_platform().ray_noset_envvars():
+    platform = get_platform()
+    # Keep Ray's per-worker device visibility outside the TPU topology setup.
+    if platform.device_name != "tpu":
+        return env_vars
+    for var in platform.ray_noset_envvars():
         env_vars[var] = "1"
     pgs = resource_pool.get_placement_groups(device_name=device_name)
-    tpu_env = get_platform().get_tpu_env_vars(
+    tpu_env = platform.get_tpu_env_vars(
         rank=rank,
         world_size=world_size,
         local_rank=local_rank,
