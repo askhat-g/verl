@@ -86,3 +86,29 @@ ray job status --address http://localhost:23333 <JOB_ID>
 ```bash
 ray job logs --follow --address http://localhost:23333 <JOB_ID>
 ```
+
+### Verify Raiden Weight Sync
+Both checks are selected by a single engine kwarg (code default `off`):
+`+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.verify_parity=<off|norm|exact|all>`
+(`True` means `norm`, `False` means `off`). This is the only place the setting is read: the trainer's
+`RaidenCheckpointEngine` and the orchestrator both see `engine_kwargs.raiden`, so a top-level
+`engine_kwargs.verify_parity` is ignored. Both checks are implemented by `RaidenParityCheck` in
+[`raiden_checkpoint_engine.py`](../../../verl/checkpoint_engine/raiden_checkpoint_engine.py).
+`run_qwen3_0_6b_torchtitan.sh` sets it to `True`.
+
+| Check | Value | When it runs | What it catches |
+|-------|-------|--------------|-----------------|
+| Exact parity | `exact` or `all` | Step-0 sync of a fresh run (trainer weights equal the checkpoint vLLM loaded) | Any wrong byte: misplaced shard slices, wrong tiling, bad fusion/transpose |
+| Norm parity | `norm` (`True`) or `all` | Every sync from step 1 | Lost or scaled weights (L1/L2 within `1e-3`); cannot see reordered bytes |
+
+Run the exact check after changing the trainer/rollout sharding or upgrading `tpu-sync` / `torch-tpu`. The
+orchestrator (TaskRunner) logs one summary for all sampler ranks, e.g.
+`[RAIDEN PARITY EXACT | Step 0] 32 sampler ranks, [515] tensors checked per rank, 0 mismatched, 0 unresolved`,
+followed by one line per mismatched tensor and rank. It costs about 0.4 s once per rank.
+
+The norm check compares the trainer's global L1/L2/numel against the sum over sampler ranks. Each
+rank reports a `replicas` count per tensor (how many TP ranks hold the same slice, e.g. GQA k/v heads
+when TP size > number of KV heads), and the orchestrator divides by it so replicated slices are counted once.
+A passing step logs `[RAIDEN PARITY VERIFIED | Step N] 100% DISTRIBUTED NORM PARITY CONFIRMED!` with the
+global L1/L2 values and deltas. A failing step logs `[RAIDEN PARITY MISMATCH | Step N]` with the first 10
+mismatched tensors.

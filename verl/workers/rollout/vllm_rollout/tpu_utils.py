@@ -290,6 +290,7 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         staging_tensors = {}
         variable_protos = []
         valid_params = []
+        replicas = {}
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
@@ -307,6 +308,9 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
                     local_shape[0] = g_shape[0] // tp_size
 
             sharding_mesh = [tp_size if axis == "tp" else 1 for axis in spec_axes]
+            # Number of TP ranks holding this same slice: 1 for a plain split, tp_size // num_kv_heads for GQA k/v,
+            # tp_size for unsharded tensors (norms). The norm parity check divides by it when summing over ranks.
+            replicas[name] = tp_size // int(np.prod(sharding_mesh))
 
             # Allocate local TPU staging buffer with matching layout
             t = torch.empty(local_shape, dtype=torch.bfloat16, device=torch.device("tpu"))
@@ -327,6 +331,7 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         self._raiden_staging = staging_tensors
         self._sorted_vllm_params = valid_params
+        self._raiden_replicas = replicas
 
         try:
             from torch_tpu._internal import sync as torch_tpu_sync
@@ -382,13 +387,18 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         return True
 
     @torch.no_grad()
-    def install_raiden_weights(self) -> dict[str, float]:
+    def install_raiden_weights(self, exact_parity: bool = False) -> dict:
         """Install received weights from host staging buffer into TPU HBM via zero-copy H2D DMA
         and fuse/transpose them directly into vLLM model parameters.
 
+        Args:
+            exact_parity: Set by RaidenParityCheck on the step-0 sync: compare every received tensor bit for bit
+                with the vLLM parameter it overwrites.
+
         Returns:
             Per-worker timings in seconds: ``total`` (whole install), ``h2d`` (pure ``_raiden_ws.h2d()``)
-            and ``sync`` (final TPU sync barrier). Empty if the synchronizer is not initialized.
+            and ``sync`` (final TPU sync barrier), plus ``exact_parity`` (this rank's
+            ``RaidenParityCheck.exact_result``) when requested. Empty if the synchronizer is not initialized.
         """
         if not hasattr(self, "_raiden_ws") or self._raiden_ws is None:
             logging.getLogger(__name__).warning(
@@ -446,6 +456,11 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         ]
 
         consumed_staging = set()
+        parity = None
+        if exact_parity:
+            from verl.checkpoint_engine.raiden_checkpoint_engine import RaidenParityCheck
+
+            parity = RaidenParityCheck("exact")
 
         # 1. Handle fused projections (QKV and Gate-Up)
         for target_suffix, src_suffixes in FUSED_MAP:
@@ -466,10 +481,13 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
                             parts = [self._raiden_staging[sk] for sk in layer_src_keys]
                             fused = torch.cat(parts, dim=0)
                             fused_adapted = to_target_layout(fused, target_local, is_flipped)
+                            if parity:
+                                parity.check_exact(resolved_key, target_local, fused_adapted)
                             target_local.copy_(fused_adapted)
                             consumed_staging.update(layer_src_keys)
 
         # 2. Handle all remaining non-fused parameters (o_proj, down_proj, layernorms, embeddings)
+        unresolved = []
         for name, src_t in self._raiden_staging.items():
             if name in consumed_staging:
                 continue
@@ -480,7 +498,11 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
                 parent_mod = get_parent_mod(resolved_key)
                 is_flipped = bool(getattr(parent_mod, "_tpu_weight_flipped", False))
                 adapted = to_target_layout(src_t, target_local, is_flipped)
+                if parity:
+                    parity.check_exact(resolved_key, target_local, adapted)
                 target_local.copy_(adapted)
+            else:
+                unresolved.append(name)
 
         # 3. Handle tied word embeddings. Only when the trainer did not send lm_head itself: for untied
         #    models (e.g. Qwen3-8B / 32B) the received lm_head must not be overwritten by embed_tokens.
@@ -518,7 +540,10 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             f"(H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
         )
         # Returned through collective_rpc so the orchestrator can log them as step metrics.
-        return {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+        result = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+        if parity:
+            result["exact_parity"] = parity.exact_result(getattr(self, "rank", 0), unresolved)
+        return result
 
     def get_model_weights_stats(self, include_shards: bool = False) -> dict:
         """Computes deterministic parameter count, L1 norm, and L2 norm across all model parameters.
@@ -540,6 +565,10 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         res = compute_tensor_stats(self._sorted_vllm_params)
         res["rank"] = rank_val
+        replicas = getattr(self, "_raiden_replicas", {})
+        for name, stats in res["per_tensor"].items():
+            if name in replicas:
+                stats["replicas"] = replicas[name]
 
         return res
 
