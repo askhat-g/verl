@@ -214,8 +214,12 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         worker = getattr(self, "worker", self)
         return worker.model_runner.model
 
-    def init_raiden_sync_on_worker(self, parallelism: int = 8) -> bool:
-        """Initialize Raiden WeightSynchronizer listener and register with central RaidenController."""
+    def init_raiden_sync_on_worker(self, parallelism: int = 8, job_name: str = "sampler") -> bool:
+        """Initialize Raiden WeightSynchronizer listener and register with central RaidenController.
+
+        ``job_name`` is the Raiden job this replica registers under; the orchestrator gives every rollout replica
+        its own name when there are several, so their ranks ``0..TP-1`` do not collide on the controller.
+        """
         if hasattr(self, "_raiden_ws") and self._raiden_ws is not None:
             return True
 
@@ -232,7 +236,10 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         bind_ip = ray.util.get_node_ip_address().strip("[]")
         rank_val = getattr(self, "rank", 0)
-        listener_port = 12000 + rank_val
+        # Let the OS pick the control listener port, as the trainer side does. ``rank`` is the rank inside this
+        # replica, so a fixed ``12000 + rank`` collides as soon as two replicas share a host. The port actually
+        # bound is read back from the synchronizer and registered with the controller below.
+        listener_port = 0
 
         # 1. Fetch RaidenController address and un-fused global shapes from TPUWeightRegistry
         from verl.checkpoint_engine.tpu_weight_registry import get_tpu_weight_registry
@@ -354,7 +361,7 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             from tpu_sync.rpc import raiden_controller
 
             ctrl_client = raiden_controller.RaidenControllerClientFacade(controller_addr)
-            unit_id = raiden_controller.RaidenId("sampler", str(rank_val), "weights")
+            unit_id = raiden_controller.RaidenId(job_name, str(rank_val), "weights")
             ctrl_client.register_work_unit(
                 unit_id,
                 [f"{bind_ip}:{self._raiden_ws.local_port}"],

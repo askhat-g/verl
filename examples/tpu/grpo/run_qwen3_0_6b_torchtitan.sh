@@ -93,6 +93,11 @@ export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-4}"    # TPU chips per rollout host
 TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
 
+# Rollout parallelism. By default one vLLM replica spans every rollout chip. ROLLOUT_TP=<chips per host>
+# gives one replica per rollout host instead (verl creates TOTAL_ROLLOUT_CHIPS / ROLLOUT_TP replicas), e.g.
+# NNODES_ROLLOUT=2 N_CHIPS_ROLLOUT=8 ROLLOUT_TP=8 -> two TP=8 replicas. Replicas sharing a host are not supported.
+ROLLOUT_TP="${ROLLOUT_TP:-${TOTAL_ROLLOUT_CHIPS}}"
+
 # Sequence budget. max_model_len must cover prompt + response, otherwise vLLM
 # silently truncates the generation and the reward is always zero.
 MAX_PROMPT_LEN=512
@@ -170,7 +175,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.enable_prefix_caching=False \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.no_enable_prefix_caching=True \
-    actor_rollout_ref.rollout.tensor_model_parallel_size="${TOTAL_ROLLOUT_CHIPS}" \
+    actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.temperature=1.0 \

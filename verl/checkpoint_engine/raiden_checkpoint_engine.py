@@ -622,6 +622,26 @@ class RaidenCheckpointEngine(CheckpointEngine):
         return None
 
 
+def _replica_num_workers(replica) -> int:
+    """Number of Raiden work units a rollout replica registers: one per TP worker."""
+    if getattr(replica, "world_size", None):
+        return replica.world_size
+    if getattr(replica, "workers", None):
+        return len(replica.workers)
+    return 1
+
+
+def _sampler_job_name(replica_idx: int, num_replicas: int) -> str:
+    """Raiden job name of a rollout replica: ``sampler`` with one replica, ``sampler<idx>`` with several.
+
+    A rollout worker registers as (job name, rank within its replica). With several replicas the ranks
+    ``0..TP-1`` would all collide under one name, and the controller would wait for ranks ``TP..N*TP-1`` that
+    nothing ever registers. One job name per replica keeps every registration unique; a single replica keeps
+    the historical name.
+    """
+    return "sampler" if num_replicas == 1 else f"sampler{replica_idx}"
+
+
 async def update_raiden_weights(
     manager,
     global_steps: Optional[int] = None,
@@ -662,9 +682,10 @@ async def update_raiden_weights(
     t_init_sampler_start = time.perf_counter()
     sampler_init_futures = [
         replica.server_handle.collective_rpc.remote(
-            method="init_raiden_sync_on_worker", kwargs={"parallelism": parallelism}
+            method="init_raiden_sync_on_worker",
+            kwargs={"parallelism": parallelism, "job_name": _sampler_job_name(replica_idx, len(manager.replicas))},
         )
-        for replica in manager.replicas
+        for replica_idx, replica in enumerate(manager.replicas)
     ]
     await asyncio.gather(*sampler_init_futures)
     t_init_sampler = time.perf_counter() - t_init_sampler_start
@@ -675,28 +696,25 @@ async def update_raiden_weights(
     # controller and does not need to be repeated on every weight sync iteration.
     t_barrier_start = time.perf_counter()
 
-    # Calculate total rollout workers across replicas and create their Raiden IDs ('0'..'N-1').
+    # One group of destination units per rollout replica: ranks '0'..'TP-1' under the replica's own job name.
     # Examples:
-    #   - 1 replica with TP=8 (our case): len(replicas)=1, r.world_size=8 -> 8 workers ['0'..'7'].
-    #   - 2 replicas with TP=4 (DP=2): len(replicas)=2, each world_size=4 -> 8 workers ['0'..'7'].
-    num_rollout_workers = 0
-    for r in manager.replicas:
-        if hasattr(r, "world_size") and r.world_size:
-            num_rollout_workers += r.world_size
-        elif hasattr(r, "workers") and r.workers:
-            num_rollout_workers += len(r.workers)
-        else:
-            num_rollout_workers += 1
-    if num_rollout_workers == 0:
-        num_rollout_workers = len(manager.replicas)
-    sampler_replica_ids = [str(i) for i in range(num_rollout_workers)]
+    #   - 1 replica with TP=8: one group ['0'..'7'] under job "sampler".
+    #   - 3 replicas with TP=8: groups ['0'..'7'] under "sampler0", "sampler1", "sampler2".
+    num_replicas = len(manager.replicas)
     trainer_replica_ids = [str(i) for i in range(manager.actor_wg.world_size)]
 
     from tpu_sync.api.common import RaidenId
     from tpu_sync.rpc.raiden_controller import RaidenMemoryType
 
     src_units = [RaidenId(job_name="trainer", job_replica_id=r_id, data_name="weights") for r_id in trainer_replica_ids]
-    dst_units = [RaidenId(job_name="sampler", job_replica_id=r_id, data_name="weights") for r_id in sampler_replica_ids]
+    dst_unit_groups = [
+        [
+            RaidenId(job_name=_sampler_job_name(replica_idx, num_replicas), job_replica_id=str(k), data_name="weights")
+            for k in range(_replica_num_workers(replica))
+        ]
+        for replica_idx, replica in enumerate(manager.replicas)
+    ]
+    dst_units = [unit for group in dst_unit_groups for unit in group]
 
     if not hasattr(manager, "raiden_controller") or manager.raiden_controller is None:
         raise RuntimeError(
@@ -728,17 +746,27 @@ async def update_raiden_weights(
 
     # 4. Trigger coordinated P2P network transfers via central RaidenController
     t_transfer_start = time.perf_counter()
-    transfer_future = manager.raiden_controller.start_transfer(
-        src_units=src_units,
-        dst_units=dst_units,
-        dst_mem_type=RaidenMemoryType.DRAM,
-        use_block_chunks=True,
-        is_sender=True,
-        expected_block_count=0,
-        parallelism=parallelism,
-        req_id=f"verl_step_{global_steps or 0}",
-    )
-    await transfer_future.wait()
+    # One transfer per replica. Each has the destination mesh of the validated single-replica case ([1, TP]),
+    # instead of one transfer whose destination mixes the ranks of several meshes. The transfers are issued
+    # together and awaited together: the controller tracks each by its own req_id / uuid and the trainer ranks
+    # keep their D2H and skip-tiling state per uuid, so the replicas overlap instead of paying the per-transfer
+    # latency one after another. The trainer buffers are only released after every transfer has finished.
+    transfer_futures = []
+    for replica_idx, dst_group in enumerate(dst_unit_groups):
+        req_id = f"verl_step_{global_steps or 0}" + (f"_replica{replica_idx}" if num_replicas > 1 else "")
+        transfer_futures.append(
+            manager.raiden_controller.start_transfer(
+                src_units=src_units,
+                dst_units=dst_group,
+                dst_mem_type=RaidenMemoryType.DRAM,
+                use_block_chunks=True,
+                is_sender=True,
+                expected_block_count=0,
+                parallelism=parallelism,
+                req_id=req_id,
+            )
+        )
+    await asyncio.gather(*[future.wait() for future in transfer_futures])
     t_transfer = time.perf_counter() - t_transfer_start
 
     # The trainer buffers are no longer read once the transfer is done; free them (unless disabled)
@@ -826,10 +854,21 @@ async def _verify_parity_async(manager, global_steps: Optional[int] = None) -> N
     step_key = global_steps if global_steps is not None else 0
     if step_key <= 0:
         return
+    # The norms of all rollout workers are summed before comparing with the trainer, which only describes one
+    # model copy. With several replicas (several full copies) compare each replica with the trainer on its own.
+    if len(manager.replicas) > 1:
+        for replica_idx, replica in enumerate(manager.replicas):
+            logger.info(f"[RAIDEN PARITY] step {step_key}: checking rollout replica {replica_idx}")
+            await _verify_replica_parity_async(manager.actor_wg, [replica], step_key)
+        return
+    await _verify_replica_parity_async(manager.actor_wg, list(manager.replicas), step_key)
 
+
+async def _verify_replica_parity_async(actor_wg, replicas: list, step_key: int) -> None:
+    """Compare the trainer's norms with the summed norms of the workers of ``replicas`` (one model copy)."""
     try:
         registry = ray.get_actor("TPUWeightRegistry", namespace="verl")
-        num_trainer_ranks = manager.actor_wg.world_size
+        num_trainer_ranks = actor_wg.world_size
         trainer_entry = None
         for _ in range(25):
             entry = await registry.get_stats.remote(step_key)
@@ -843,7 +882,7 @@ async def _verify_parity_async(manager, global_steps: Optional[int] = None) -> N
             replica.server_handle.collective_rpc.remote(
                 method="get_model_weights_stats", kwargs={"include_shards": False}
             )
-            for replica in manager.replicas
+            for replica in replicas
         ]
         sampler_entries = await asyncio.gather(*sampler_futures)
 

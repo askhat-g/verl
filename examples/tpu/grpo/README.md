@@ -5,6 +5,7 @@ This directory contains examples and scripts for running **GRPO (Group Relative 
 The training setup uses:
 - **Actor Engine**: TorchTitan (`model_engine=torchtitan`)
 - **Rollout Engine**: vLLM (`actor_rollout_ref.rollout.name=vllm`)
+- **Several rollout replicas**: when the rollout pool holds more than one vLLM replica (`rollout.tensor_model_parallel_size` smaller than the number of rollout devices; with `run_qwen3_0_6b_torchtitan.sh` set `ROLLOUT_TP=<chips per host>` to get one replica per rollout host), Raiden syncs each replica in its own transfer and the parity check compares each replica with the trainer separately. Look for `[RAIDEN PARITY] step N: checking rollout replica K` followed by `PARITY VERIFIED` once per replica in the driver log.
 - **Placement Strategy**: Non-colocated multi-slice execution (Slice 0 for Trainer/Actor, Slice 1 for Rollout)
 - **TPU 7x (`2x2x1` Single-Host Topology)**: Each `2x2x1` host (`numOfHosts: 1`) provides 4 physical dual-core chips = 8 addressable TensorCore devices (`NNODES=1`, `N_CHIPS=8`, 4D mesh topology `2,2,1,2`).
 - **Multi-host trainer slices on TPU 7x**: the trainer slice can also be `2x2x2` (2 hosts, 16 devices), `2x2x4` (4 hosts, 32 devices), `2x4x4` (8 hosts, 64 devices) or `4x4x4` (16 hosts, 128 devices). The 4D topology is looked up by device count in `TPU_V7X_TOPOLOGY_MAP` (`verl/plugin/platform/platform_tpu.py`); a shape missing from that table logs a warning and falls back to the single-device topology, which does not work for a multi-host trainer.
