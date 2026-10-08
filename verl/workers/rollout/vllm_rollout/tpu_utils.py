@@ -285,14 +285,11 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         # every sync. Unfused tensors (o_proj, down_proj, norms, embed_tokens, lm_head) could bind the vLLM
         # parameter buffers directly; fused qkv_proj / gate_up_proj and transposed (_tpu_weight_flipped)
         # weights need tpu_sync to write into a slice or layout of the target tensor.
-        from verl.checkpoint_engine.raiden_checkpoint_engine import apply_raiden_skip_tiling, raiden_is_tile_aligned
-
         ROW_PARALLEL_SUFFIXES = (".o_proj.weight", ".down_proj.weight")
 
         staging_tensors = {}
         variable_protos = []
         valid_params = []
-        skip_tiling_plan = []
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
@@ -315,8 +312,6 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             t = torch.empty(local_shape, dtype=torch.bfloat16, device=torch.device("tpu"))
             staging_tensors[name] = t
             valid_params.append((name, t))
-            # Tile-aligned local shards can skip the CPU (de)tiling pass and DMA straight to HBM.
-            skip_tiling_plan.append(raiden_is_tile_aligned(local_shape))
 
             variable_protos.append(
                 raiden_service_pb2.VariableMetadataProto(
@@ -354,8 +349,11 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             bind_ip=bind_ip,
         )
 
-        self._skip_tiling_plan = skip_tiling_plan
-        apply_raiden_skip_tiling(self._raiden_ws, skip_tiling_plan)
+        # Whether a tensor can skip the CPU (de)tiling pass is decided by Raiden's planner per transfer, from the
+        # SOURCE and destination slices together, and delivered to this listener with the transfer. Setting it here
+        # from the local shape alone made the two sides disagree whenever a trainer shard was not 8-row aligned
+        # (e.g. Qwen3's embedding at 32+ FSDP ranks): the sender de-tiled to row-major and h2d() copied those bytes
+        # raw into tiled HBM, permuting the weights while leaving every norm unchanged.
 
         try:
             from tpu_sync.rpc import raiden_controller
@@ -400,11 +398,6 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         t_start = time.perf_counter()
         t_h2d_start = time.perf_counter()
-        # Re-apply the skip_tiling plan right before H2D: the network listener overwrites it with its default.
-        if getattr(self, "_skip_tiling_plan", None):
-            from verl.checkpoint_engine.raiden_checkpoint_engine import apply_raiden_skip_tiling
-
-            apply_raiden_skip_tiling(self._raiden_ws, self._skip_tiling_plan)
         self._raiden_ws.h2d()
         t_h2d = time.perf_counter() - t_h2d_start
 
