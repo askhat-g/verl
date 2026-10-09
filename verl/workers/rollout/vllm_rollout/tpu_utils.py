@@ -286,6 +286,15 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         # parameter buffers directly; fused qkv_proj / gate_up_proj and transposed (_tpu_weight_flipped)
         # weights need tpu_sync to write into a slice or layout of the target tensor.
         ROW_PARALLEL_SUFFIXES = (".o_proj.weight", ".down_proj.weight")
+        KV_PROJ_SUFFIXES = (".self_attn.k_proj.weight", ".self_attn.v_proj.weight")
+
+        # GQA with tp_size > num_kv_heads: vLLM replicates each KV head on tp_size // num_kv_heads ranks, so a
+        # dim-0 split over tp would cut heads apart. Register k/v as one slice per KV head and pass this rank's
+        # head via global_shard_indices (ranks sharing a head receive the same slice).
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        num_kv_heads = worker.vllm_config.model_config.get_total_num_kv_heads()
+        kv_head_idx = get_tensor_model_parallel_rank() // (tp_size // num_kv_heads) if num_kv_heads < tp_size else None
 
         staging_tensors = {}
         variable_protos = []
@@ -296,18 +305,27 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             g_shape = list(g_shape)
             spec_axes = [""] * len(g_shape)
             local_shape = list(g_shape)
+            tp_axis_size = tp_size  # number of slices along the "tp" mesh axis
+            global_shard_indices = []  # empty = tpu-sync derives this rank's slice from the mesh geometry
 
             if len(g_shape) == 2:
                 if any(name.endswith(s) for s in ROW_PARALLEL_SUFFIXES):
                     # Row parallel: partition input dimension (dim 1) across TP ranks
                     spec_axes = ["", "tp"]
                     local_shape[1] = g_shape[1] // tp_size
+                elif kv_head_idx is not None and name.endswith(KV_PROJ_SUFFIXES):
+                    # GQA with tp_size > num_kv_heads (see above): one slice per KV head; this rank holds head
+                    # kv_head_idx, e.g. Qwen3-32B TP32: k_proj [1024, 5120] -> mesh [8, 1], rank 13 -> slice 3.
+                    spec_axes = ["tp", ""]
+                    tp_axis_size = num_kv_heads
+                    local_shape[0] = g_shape[0] // num_kv_heads
+                    global_shard_indices = [kv_head_idx]
                 elif g_shape[0] % tp_size == 0:
                     # Column parallel or vocab parallel: partition output dimension (dim 0) across TP ranks
                     spec_axes = ["tp", ""]
                     local_shape[0] = g_shape[0] // tp_size
 
-            sharding_mesh = [tp_size if axis == "tp" else 1 for axis in spec_axes]
+            sharding_mesh = [tp_axis_size if axis == "tp" else 1 for axis in spec_axes]
             # Number of TP ranks holding this same slice: 1 for a plain split, tp_size // num_kv_heads for GQA k/v,
             # tp_size for unsharded tensors (norms). The norm parity check divides by it when summing over ranks.
             replicas[name] = tp_size // int(np.prod(sharding_mesh))
@@ -326,6 +344,7 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
                     item_size=t.element_size(),
                     layer_idx=idx,
                     sharding_spec=spec_axes,
+                    global_shard_indices=global_shard_indices,
                 )
             )
 
