@@ -1,0 +1,455 @@
+# Per-run Ray cluster manifest (Head Service + JobSet) for GKE Node Auto-Provisioning (NAP)
+# TPU v5p clusters managed by Kueue + JobSet (such as `bodaborg-v5p-nap` in `europe-west4`,
+# project `cloud-tpu-shared-capacity`), where the KubeRay operator CRD is not installed.
+#
+# Rendered and applied by `examples/tpu/grpo/run_grpo_v5p_nap.sh` (using Python `string.Template`
+# or `envsubst`), then deleted on exit (`kubectl delete jobset,svc`) to release Kueue quota
+# and allow GKE NAP to scale down idle TPU nodes.
+#
+# Architecture:
+# - Head Service (`${RAY_CLUSTER_NAME}-head-svc`): ClusterIP service exposing the Ray head pod
+#   ports (6379 GCS, 8265 Dashboard/Jobs API, 10001 Ray Client) to TPU worker slices.
+# - JobSet (`${RAY_CLUSTER_NAME}`):
+#   * Queued via Kueue (`kueue.x-k8s.io/queue-name: ${KUEUE_QUEUE}`).
+#   * `head` replicatedJob (1 replica on `cpu-np` nodepool, matching Kueue `cpu-user` flavor):
+#     runs `ray start --head --num-cpus=0 --num-gpus=0 --block`.
+#   * `trainer` replicatedJob (`${TRAINER_SLICE_REPLICAS}` slice(s), `${TRAINER_HOSTS_PER_SLICE}`
+#     host(s) per slice, topology `${TRAINER_NODE_TOPOLOGY}`): registers custom Ray resources
+#     `{"TPU": ${WORKER_TPU_CHIPS}, "tpu-group-<SLICE_ID>": 1}` (default `tpu-group-0`).
+#   * `rollout` replicatedJob (`${ROLLOUT_SLICE_REPLICAS}` slice(s), `${ROLLOUT_HOSTS_PER_SLICE}`
+#     host(s) per slice, topology `${ROLLOUT_NODE_TOPOLOGY}`): registers custom Ray resources
+#     `{"TPU": ${WORKER_TPU_CHIPS}, "tpu-group-<TRAINER_SLICE_REPLICAS + SLICE_ID>": 1}`
+#     (e.g., `tpu-group-1`, `tpu-group-2`), allowing heterogeneous trainer vs. sampler slices
+#     (such as 1 x 8-chip `2x2x2` trainer slice + 2 x 4-chip `2x2x1` sampler slices).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${RAY_CLUSTER_NAME}-head-svc
+  namespace: ${RAY_NAMESPACE}
+  labels:
+    verl-nap/managed: "true"
+    verl-nap/cluster: ${RAY_CLUSTER_NAME}
+    verl-nap/run-id: "${RUN_ID}"
+  annotations:
+    verl-nap/owner: "${RUN_OWNER}"
+spec:
+  selector:
+    verl-nap/cluster: ${RAY_CLUSTER_NAME}
+    verl-nap/role: head
+  ports:
+    - name: gcs
+      port: 6379
+      targetPort: 6379
+    - name: dashboard
+      port: 8265
+      targetPort: 8265
+    - name: client
+      port: 10001
+      targetPort: 10001
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: ${RAY_CLUSTER_NAME}
+  namespace: ${RAY_NAMESPACE}
+  labels:
+    kueue.x-k8s.io/queue-name: ${KUEUE_QUEUE}
+    verl-nap/managed: "true"
+    verl-nap/cluster: ${RAY_CLUSTER_NAME}
+    verl-nap/run-id: "${RUN_ID}"
+  annotations:
+    verl-nap/owner: "${RUN_OWNER}"
+spec:
+  replicatedJobs:
+    - name: head
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                verl-nap/managed: "true"
+                verl-nap/cluster: ${RAY_CLUSTER_NAME}
+                verl-nap/role: head
+                verl-nap/run-id: "${RUN_ID}"
+              annotations:
+                cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+            spec:
+              priorityClassName: ${PRIORITY_CLASS}
+              serviceAccountName: ${SERVICE_ACCOUNT}
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-nodepool: ${HEAD_NODEPOOL}
+              tolerations:
+                - key: cloud.google.com/gke-nodepool
+                  operator: Equal
+                  value: ${HEAD_NODEPOOL}
+                  effect: NoSchedule
+              # Note: the static `cpu-np` node pool on `bodaborg-v5p-nap` does not have GKE
+              # Workload Identity enabled at the node-pool level, so `gcsfuse.csi.storage.gke.io`
+              # is only mounted on the NAP-provisioned TPU worker pods below. Setting `--num-cpus=0`
+              # on `ray-head` ensures `TaskRunnerV1` and all CPU/TPU actors that access `/data`
+              # are scheduled onto the TPU worker pods where `/data` is mounted.
+              containers:
+                - name: ray-head
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  command: ["/bin/bash", "-lc"]
+                  args:
+                    - >-
+                      ray start --head
+                      --port=6379
+                      --dashboard-host=0.0.0.0
+                      --dashboard-port=8265
+                      --ray-client-server-port=10001
+                      --num-cpus=0
+                      --num-gpus=0
+                      --block
+                  env:
+                    - name: RAY_TRAIN_V2_ENABLED
+                      value: "1"
+                    - name: TPU_ACCELERATOR_TYPE
+                      value: "${TPU_ACCELERATOR_TYPE}"
+                    - name: LIBTPU_INIT_ARGS
+                      value: "--slicebuilder_use_insecure_grpc=true --undefok=slicebuilder_use_insecure_grpc"
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-secret
+                          key: hf_token
+                          optional: true
+                  ports:
+                    - containerPort: 8265
+                    - containerPort: 10001
+                    - containerPort: 6379
+                  resources:
+                    limits:
+                      cpu: "${HEAD_CPU}"
+                      memory: "${HEAD_MEMORY}"
+                    requests:
+                      cpu: "${HEAD_CPU}"
+                      memory: "${HEAD_MEMORY}"
+                  volumeMounts:
+                    - name: host-tmp
+                      mountPath: /tmp
+              volumes:
+                - name: host-tmp
+                  hostPath:
+                    path: /tmp
+    - name: trainer
+      replicas: ${TRAINER_SLICE_REPLICAS}
+      template:
+        spec:
+          parallelism: ${TRAINER_HOSTS_PER_SLICE}
+          completions: ${TRAINER_HOSTS_PER_SLICE}
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                verl-nap/managed: "true"
+                verl-nap/cluster: ${RAY_CLUSTER_NAME}
+                verl-nap/role: worker
+                verl-nap/worker-group: trainer
+                verl-nap/run-id: "${RUN_ID}"
+              annotations:
+                gke-gcsfuse/volumes: "true"
+                gke-gcsfuse/cpu-limit: "0"
+                gke-gcsfuse/memory-limit: "0"
+                gke-gcsfuse/ephemeral-storage-limit: "0"
+            spec:
+              priorityClassName: ${PRIORITY_CLASS}
+              serviceAccountName: ${SERVICE_ACCOUNT}
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: ${TPU_NODE_SELECTOR_ACCEL}
+                cloud.google.com/gke-tpu-topology: ${TRAINER_NODE_TOPOLOGY}
+                cloud.google.com/reservation-name: ${RESERVATION_NAME}
+              tolerations:
+                - key: cloud.google.com/reservation-name
+                  operator: Equal
+                  value: ${RESERVATION_NAME}
+                  effect: NoSchedule
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              containers:
+                - name: ray-worker
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  command: ["/bin/bash", "-lc"]
+                  args:
+                    - |
+                      python3 -u - <<'PY'
+                      from concurrent.futures import ThreadPoolExecutor
+                      import glob, json, os, socket, time
+                      # GKE's TPU JobSet webhook injects MEGASCALE_* across all replicatedJobs in the JobSet.
+                      # Strip them before starting Ray so Trainer and Rollout slices initialize independent
+                      # per-slice libtpu meshes.
+                      for k in (
+                          "MEGASCALE_COORDINATOR_ADDRESS",
+                          "MEGASCALE_NUM_SLICES",
+                          "MEGASCALE_SLICE_ID",
+                          "TPU_WORKER_HOSTNAMES",
+                          "TPU_WORKER_ID",
+                      ):
+                          os.environ.pop(k, None)
+                      # Pre-warm all *.safetensors checkpoint shards sequentially into the Linux kernel page
+                      # cache across 16 parallel sequential streams before starting Ray. Without sequential
+                      # pre-warming, multi-rank mmap page faults across 96 CPUs cause GCSFuse to switch to
+                      # random-read mode and open thousands of transatlantic HTTP Range requests.
+                      model_dir = "${PREWARM_MODEL_PATH}"
+                      shards = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+                      if shards:
+                          t0 = time.time()
+                          total = 0
+                          for ckpt in shards:
+                              size = os.path.getsize(ckpt)
+                              n_streams = 16
+                              chunk = max(1, (size + n_streams - 1) // n_streams)
+                              def _read_range(idx: int, path: str = ckpt, sz: int = size, ch: int = chunk) -> int:
+                                  start = idx * ch
+                                  if start >= sz:
+                                      return 0
+                                  end = min(sz, start + ch)
+                                  read_bytes = 0
+                                  with open(path, "rb", buffering=16 * 1024 * 1024) as f:
+                                      f.seek(start)
+                                      while start + read_bytes < end:
+                                          buf = f.read(min(16 * 1024 * 1024, end - (start + read_bytes)))
+                                          if not buf:
+                                              break
+                                          read_bytes += len(buf)
+                                  return read_bytes
+                              with ThreadPoolExecutor(max_workers=n_streams) as ex:
+                                  total += sum(ex.map(_read_range, range(n_streams)))
+                          print(f"[verl-nap] Pre-warmed {len(shards)} shard(s) in {model_dir} ({total / 1e6:.1f} MB) in {time.time() - t0:.2f}s", flush=True)
+                      head = "${RAY_CLUSTER_NAME}-head-svc.${RAY_NAMESPACE}.svc.cluster.local"
+                      for _ in range(180):
+                          try:
+                              with socket.create_connection((head, 6379), timeout=2):
+                                  break
+                          except OSError:
+                              time.sleep(2)
+                      else:
+                          raise RuntimeError(f"Timed out waiting for Ray head at {head}:6379")
+                      slice_id = int(os.environ.get("SLICE_ID", "0"))
+                      res = json.dumps({"TPU": int("${WORKER_TPU_CHIPS}"), f"tpu-group-{slice_id}": 1})
+                      print(f"[verl-nap] Starting Ray trainer worker on slice tpu-group-{slice_id} -> {head}:6379 with resources={res}", flush=True)
+                      os.execvp("ray", [
+                          "ray", "start",
+                          f"--address={head}:6379",
+                          "--num-cpus=${WORKER_CPU}",
+                          f"--resources={res}",
+                          "--block",
+                      ])
+                      PY
+                  env:
+                    - name: SLICE_ID
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+                    - name: TPU_ACCELERATOR_TYPE
+                      value: "${TPU_ACCELERATOR_TYPE}"
+                    - name: LIBTPU_INIT_ARGS
+                      value: "--slicebuilder_use_insecure_grpc=true --undefok=slicebuilder_use_insecure_grpc"
+                    - name: OMP_NUM_THREADS
+                      value: "4"
+                    - name: RAY_TRAIN_V2_ENABLED
+                      value: "1"
+                    - name: RAY_memory_monitor_refresh_ms
+                      value: "0"
+                    - name: RAY_memory_usage_threshold
+                      value: "0.99"
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-secret
+                          key: hf_token
+                          optional: true
+                  resources:
+                    limits:
+                      cpu: "${WORKER_CPU}"
+                      memory: "${WORKER_MEMORY}"
+                      google.com/tpu: "${WORKER_TPU_CHIPS}"
+                    requests:
+                      cpu: "${WORKER_CPU}"
+                      memory: "${WORKER_MEMORY}"
+                      google.com/tpu: "${WORKER_TPU_CHIPS}"
+                  volumeMounts:
+                    - name: gcs-volume
+                      mountPath: /data
+                    - name: host-tmp
+                      mountPath: /tmp
+                    - name: dshm
+                      mountPath: /dev/shm
+              volumes:
+                - name: gcs-volume
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    volumeAttributes:
+                      bucketName: ${GCS_BUCKET}
+                      mountOptions: "implicit-dirs"
+                - name: host-tmp
+                  hostPath:
+                    path: /tmp
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 64Gi
+    - name: rollout
+      replicas: ${ROLLOUT_SLICE_REPLICAS}
+      template:
+        spec:
+          parallelism: ${ROLLOUT_HOSTS_PER_SLICE}
+          completions: ${ROLLOUT_HOSTS_PER_SLICE}
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                verl-nap/managed: "true"
+                verl-nap/cluster: ${RAY_CLUSTER_NAME}
+                verl-nap/role: worker
+                verl-nap/worker-group: rollout
+                verl-nap/run-id: "${RUN_ID}"
+              annotations:
+                gke-gcsfuse/volumes: "true"
+                gke-gcsfuse/cpu-limit: "0"
+                gke-gcsfuse/memory-limit: "0"
+                gke-gcsfuse/ephemeral-storage-limit: "0"
+            spec:
+              priorityClassName: ${PRIORITY_CLASS}
+              serviceAccountName: ${SERVICE_ACCOUNT}
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: ${TPU_NODE_SELECTOR_ACCEL}
+                cloud.google.com/gke-tpu-topology: ${ROLLOUT_NODE_TOPOLOGY}
+                cloud.google.com/reservation-name: ${RESERVATION_NAME}
+              tolerations:
+                - key: cloud.google.com/reservation-name
+                  operator: Equal
+                  value: ${RESERVATION_NAME}
+                  effect: NoSchedule
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              containers:
+                - name: ray-worker
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  command: ["/bin/bash", "-lc"]
+                  args:
+                    - |
+                      python3 -u - <<'PY'
+                      from concurrent.futures import ThreadPoolExecutor
+                      import glob, json, os, socket, time
+                      for k in (
+                          "MEGASCALE_COORDINATOR_ADDRESS",
+                          "MEGASCALE_NUM_SLICES",
+                          "MEGASCALE_SLICE_ID",
+                          "TPU_WORKER_HOSTNAMES",
+                          "TPU_WORKER_ID",
+                      ):
+                          os.environ.pop(k, None)
+                      model_dir = "${PREWARM_MODEL_PATH}"
+                      shards = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+                      if shards:
+                          t0 = time.time()
+                          total = 0
+                          for ckpt in shards:
+                              size = os.path.getsize(ckpt)
+                              n_streams = 16
+                              chunk = max(1, (size + n_streams - 1) // n_streams)
+                              def _read_range(idx: int, path: str = ckpt, sz: int = size, ch: int = chunk) -> int:
+                                  start = idx * ch
+                                  if start >= sz:
+                                      return 0
+                                  end = min(sz, start + ch)
+                                  read_bytes = 0
+                                  with open(path, "rb", buffering=16 * 1024 * 1024) as f:
+                                      f.seek(start)
+                                      while start + read_bytes < end:
+                                          buf = f.read(min(16 * 1024 * 1024, end - (start + read_bytes)))
+                                          if not buf:
+                                              break
+                                          read_bytes += len(buf)
+                                  return read_bytes
+                              with ThreadPoolExecutor(max_workers=n_streams) as ex:
+                                  total += sum(ex.map(_read_range, range(n_streams)))
+                          print(f"[verl-nap] Pre-warmed {len(shards)} shard(s) in {model_dir} ({total / 1e6:.1f} MB) in {time.time() - t0:.2f}s", flush=True)
+                      head = "${RAY_CLUSTER_NAME}-head-svc.${RAY_NAMESPACE}.svc.cluster.local"
+                      for _ in range(180):
+                          try:
+                              with socket.create_connection((head, 6379), timeout=2):
+                                  break
+                          except OSError:
+                              time.sleep(2)
+                      else:
+                          raise RuntimeError(f"Timed out waiting for Ray head at {head}:6379")
+                      slice_id = int("${TRAINER_SLICE_REPLICAS}") + int(os.environ.get("SLICE_ID", "0"))
+                      res = json.dumps({"TPU": int("${WORKER_TPU_CHIPS}"), f"tpu-group-{slice_id}": 1})
+                      print(f"[verl-nap] Starting Ray rollout worker on slice tpu-group-{slice_id} -> {head}:6379 with resources={res}", flush=True)
+                      os.execvp("ray", [
+                          "ray", "start",
+                          f"--address={head}:6379",
+                          "--num-cpus=${WORKER_CPU}",
+                          f"--resources={res}",
+                          "--block",
+                      ])
+                      PY
+                  env:
+                    - name: SLICE_ID
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+                    - name: TPU_ACCELERATOR_TYPE
+                      value: "${TPU_ACCELERATOR_TYPE}"
+                    - name: LIBTPU_INIT_ARGS
+                      value: "--slicebuilder_use_insecure_grpc=true --undefok=slicebuilder_use_insecure_grpc"
+                    - name: OMP_NUM_THREADS
+                      value: "4"
+                    - name: RAY_TRAIN_V2_ENABLED
+                      value: "1"
+                    - name: RAY_memory_monitor_refresh_ms
+                      value: "0"
+                    - name: RAY_memory_usage_threshold
+                      value: "0.99"
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-secret
+                          key: hf_token
+                          optional: true
+                  resources:
+                    limits:
+                      cpu: "${WORKER_CPU}"
+                      memory: "${WORKER_MEMORY}"
+                      google.com/tpu: "${WORKER_TPU_CHIPS}"
+                    requests:
+                      cpu: "${WORKER_CPU}"
+                      memory: "${WORKER_MEMORY}"
+                      google.com/tpu: "${WORKER_TPU_CHIPS}"
+                  volumeMounts:
+                    - name: gcs-volume
+                      mountPath: /data
+                    - name: host-tmp
+                      mountPath: /tmp
+                    - name: dshm
+                      mountPath: /dev/shm
+              volumes:
+                - name: gcs-volume
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    volumeAttributes:
+                      bucketName: ${GCS_BUCKET}
+                      mountOptions: "implicit-dirs"
+                - name: host-tmp
+                  hostPath:
+                    path: /tmp
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 64Gi

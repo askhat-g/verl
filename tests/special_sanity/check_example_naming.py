@@ -107,6 +107,10 @@ DEFAULT_IGNORE_FILES = (
     # folding ``_multi_rs`` into a ROLLOUT_SERVER env-var toggle rather than
     # in this PR.
     "examples/rollout_correction/run_qwen2_5_7b_fsdp_multi_rs.sh",
+    # Ephemeral GKE NAP Ray JobSet lifecycle wrapper that provisions a cluster
+    # and dispatches ``run_qwen3_0_6b_torchtitan.sh`` rather than defining a
+    # model/train-backend recipe directly.
+    "examples/tpu/grpo/run_grpo_v5p_nap.sh",
 )
 
 

@@ -130,6 +130,10 @@ def run_ppo(config, task_runner_class) -> None:
     try:
         ray.get(runner.run.remote(config))
     finally:
+        import sys
+
+        sys.stdout.flush()
+        sys.stderr.flush()
         timeline_json_file = config.ray_kwargs.get("timeline_json_file", None)
         if timeline_json_file:
             ray.timeline(filename=timeline_json_file)
@@ -169,6 +173,9 @@ class TaskRunnerV1:
 
     def run(self, config: DictConfig):
         """Run the PPO training process."""
+        import sys
+        import time
+
         configure_verl_logging()
 
         import transfer_queue as tq
@@ -198,6 +205,12 @@ class TaskRunnerV1:
                     tracking.finish(exit_code=0 if succeeded else 1)
             finally:
                 tq.close()
+                # When TaskRunnerV1 runs on a remote worker node (e.g., when ray-head has --num-cpus=0),
+                # flush stdout/stderr and allow Ray's log_monitor (1s poll interval) to ship the final
+                # step/validation metric lines to the driver before ray.shutdown() disconnects.
+                sys.stdout.flush()
+                sys.stderr.flush()
+                time.sleep(2.5)
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)

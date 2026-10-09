@@ -936,6 +936,9 @@ def patch_vllm_for_tpu() -> None:
                     value = existing
             elif key == "LIBTPU_INIT_ARGS":
                 value = value.replace("--deepsea_chip_config_name=megachip_tccontrol", "")
+                if "--slicebuilder_use_insecure_grpc" not in value:
+                    insecure_flag = "--slicebuilder_use_insecure_grpc=true --undefok=slicebuilder_use_insecure_grpc"
+                    value = f"{value} {insecure_flag}".strip()
             original_driver_environ_setitem(self, key, value)
 
         os.environ.__class__.__setitem__ = patched_driver_environ_setitem
@@ -968,6 +971,9 @@ def patch_vllm_for_tpu() -> None:
                         if curr_pg is None:
                             try:
                                 pgs = ray.util.placement_group_table()
+                                replica_rank = os.environ.get("VERL_REPLICA_RANK")
+                                replica_prefix = f"rollout_pool_{replica_rank}" if replica_rank is not None else None
+                                fallback_pg = None
                                 for pg_id, pg_info in pgs.items():
                                     state = (
                                         pg_info.get("state")
@@ -991,10 +997,15 @@ def patch_vllm_for_tpu() -> None:
                                             if candidate_pg is not None:
                                                 num_bundles = len(getattr(candidate_pg, "bundle_specs", []))
                                                 if num_bundles >= parallel_config.world_size:
-                                                    curr_pg = candidate_pg
-                                                    break
+                                                    if replica_prefix and replica_prefix in str(name):
+                                                        curr_pg = candidate_pg
+                                                        break
+                                                    if fallback_pg is None:
+                                                        fallback_pg = candidate_pg
                                         except Exception:
                                             pass
+                                if curr_pg is None:
+                                    curr_pg = fallback_pg
                             except Exception:
                                 pass
                     parallel_config.placement_group = curr_pg
@@ -1332,6 +1343,11 @@ def patch_vllm_for_tpu() -> None:
                     args["TORCH_TPU_TOPOLOGY"] = topology
                     args["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = sb_addresses_str
                     args["TPU_PROCESS_ADDRESSES"] = sb_addresses_str
+                    libtpu_args = args.get("LIBTPU_INIT_ARGS", os.environ.get("LIBTPU_INIT_ARGS", ""))
+                    if "--slicebuilder_use_insecure_grpc" not in libtpu_args:
+                        insecure_flag = "--slicebuilder_use_insecure_grpc=true --undefok=slicebuilder_use_insecure_grpc"
+                        libtpu_args = f"{libtpu_args} {insecure_flag}".strip()
+                    args["LIBTPU_INIT_ARGS"] = libtpu_args
                     if total_chips > 4 or num_nodes > 1:
                         args["TPU_MULTIHOST_BACKEND"] = "ray"
 
@@ -1792,6 +1808,13 @@ async def launch_tpu_vllm_servers(replica) -> None:
     }
     if "VERL_PLATFORM" in os.environ:
         env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
+    if getattr(replica, "resource_pool", None) is not None and getattr(replica.resource_pool, "pgs", None):
+        try:
+            pg_info = ray._private.state.state.placement_group_table(replica.resource_pool.pgs[0].id)
+            if pg_info and pg_info.get("name"):
+                env_vars["VERL_ROLLOUT_PG_NAME"] = str(pg_info["name"])
+        except Exception:
+            pass
 
     flags_to_copy = set()
     for flag_var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS"):

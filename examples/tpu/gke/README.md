@@ -1,13 +1,43 @@
-# GKE KubeRay Cluster & Docker Image for TPU v6e
+# GKE Cluster Manifests & Docker Image for TPU (v5p, v6e & 7x)
 
-This directory contains the Docker image definition and KubeRay manifest for running `verl` (SFT and GRPO RL) on Google Kubernetes Engine (GKE) with **Cloud TPU v6e** (`tpu-v6e-slice`) node pools:
+This directory contains the Docker image definition and Kubernetes manifests for running `verl` (SFT and GRPO RL) on Google Kubernetes Engine (GKE) with **Cloud TPU v5p**, **v6e**, and **7x** node pools:
 
-- [`Dockerfile.tpu`](Dockerfile.tpu): Builds the unified TPU runtime image containing `torch==2.11.0`, `torch_tpu`, `torchtitan`, `vllm==0.14.0`, `vllm_tpu`, `jax==0.9.0`, `libtpu`, and `verl` (`us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260918-fi0918`).
+- [`Dockerfile.tpu`](Dockerfile.tpu): Builds the unified TPU runtime image containing `torch==2.13.0+cpu`, `torch_tpu`, `tpu-sync-torch`, `torchtitan`, `vllm==0.29.0`, `vllm-torchtpu`, `jax==0.10.2`, `libtpu==0.0.47`, and `verl` dependencies (`us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261006-tsync1006`).
+- [`ray-jobset-v5p-nap.yaml`](ray-jobset-v5p-nap.yaml): Ephemeral Ray cluster manifest (`Service` + Kueue-managed `JobSet`) for **GKE Node Auto-Provisioning (NAP) TPU v5p** clusters (`bodaborg-v5p-nap` in `europe-west4`, project `cloud-tpu-shared-capacity`) where the KubeRay operator CRD is not installed. Rendered and managed end-to-end by [`examples/tpu/grpo/run_grpo_v5p_nap.sh`](../grpo/run_grpo_v5p_nap.sh).
 - [`ray-tpu-v6e8-2slice.yaml`](ray-tpu-v6e8-2slice.yaml): KubeRay `RayCluster` manifest provisioning 1 CPU Ray head pod (`ray-head`) and 2 multi-host TPU v6e-8 slices (`numOfHosts: 2`, `google.com/tpu: 4` per host = 16 TPU v6e chips total) with GCS Fuse mounted at `/data` and `400Gi` host memory per TPU pod.
+- [`ray-tpu-v7x-2slice.yaml`](ray-tpu-v7x-2slice.yaml) / [`ray-tpu-v7x-2x2x4-2slice.yaml`](ray-tpu-v7x-2x2x4-2slice.yaml): KubeRay `RayCluster` manifests for TPU 7x (Ironwood) single-host (`2x2x1`) and multi-host (`2x2x4`) slices.
 
 ---
 
-## 🛠️ Deploying the RayCluster on GKE
+## 🛠️ Deploying on GKE
+
+### Option 1: Ephemeral Kueue `JobSet` on GKE NAP TPU v5p (`bodaborg-v5p-nap`)
+
+On shared GKE NAP clusters managed by **Kueue + JobSet** (`bodaborg-v5p-nap`), use [`examples/tpu/grpo/run_grpo_v5p_nap.sh`](../grpo/run_grpo_v5p_nap.sh) to provision an isolated Ray `JobSet` + `Service`, run the GRPO job, pull logs to local disk, and automatically delete only your `JobSet` and `Service` on exit:
+
+```bash
+# Fast 5-step Qwen3-0.6B GRPO smoke test on bodaborg-v5p-nap (2 x 2x2x1 v5p slices = 8 chips):
+SMOKE_TEST=1 bash examples/tpu/grpo/run_grpo_v5p_nap.sh
+
+# Full 100-step Qwen3-0.6B GSM8K GRPO run:
+bash examples/tpu/grpo/run_grpo_v5p_nap.sh
+
+# Heterogeneous slices: Qwen3-4B with 1 x 8-chip Trainer slice (2x2x2, 2 hosts)
+# + 2 separate 4-chip Sampler slices (2x2x1, 1 host each, 2 x TP=4 vLLM replicas):
+SMOKE_TEST=1 \
+JOB_SCRIPT=examples/tpu/grpo/run_qwen3_4b_torchtitan.sh \
+TRAINER_HOSTS_PER_SLICE=2 \
+TRAINER_NODE_TOPOLOGY=2x2x2 \
+ROLLOUT_SLICE_REPLICAS=2 \
+ROLLOUT_HOSTS_PER_SLICE=1 \
+ROLLOUT_NODE_TOPOLOGY=2x2x1 \
+ROLLOUT_TP=4 \
+bash examples/tpu/grpo/run_grpo_v5p_nap.sh
+```
+
+See [`examples/tpu/grpo/README.md`](../grpo/README.md) for full details and step-by-step manual commands.
+
+### Option 2: Long-Lived KubeRay `RayCluster` (TPU v6e / 7x)
 
 ```bash
 # Apply the KubeRay cluster manifest

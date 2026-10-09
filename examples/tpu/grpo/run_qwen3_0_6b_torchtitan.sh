@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GRPO | Qwen3-0.6B | GSM8K | TorchTitan Training & vLLM Rollout | TPU 7x (2x2x1 Single-Host) & TPU v6e
+# GRPO | Qwen3-0.6B | GSM8K | TorchTitan Training & vLLM Rollout | TPU v5p, TPU v6e & TPU 7x
 # V1 PPOTrainer (Separate Async Overlap)
 #
 # By default this runs a realistic 100-step GRPO job whose reward curve actually
@@ -31,8 +31,8 @@ set -xeuo pipefail
 
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
-# TPU generation: defaults to v6e (3D topology map). On TPU 7x, pass TPU_ACCELERATOR_TYPE=tpu7x
-# (e.g. via --runtime-env-json) to select the 4D topology map; it aborts libtpu on v6e.
+# TPU generation: defaults to v6e (2D/3D topology map). Pass TPU_ACCELERATOR_TYPE=v5p on TPU v5p
+# (3D torus topology map) or TPU_ACCELERATOR_TYPE=tpu7x on TPU 7x (4D topology map).
 export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-v6e}"
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VLLM_USE_V1=1
