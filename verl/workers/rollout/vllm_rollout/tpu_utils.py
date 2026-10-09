@@ -20,6 +20,7 @@ import logging
 import multiprocessing
 import multiprocessing.process
 import os
+import re
 import sys
 import time
 import types
@@ -1014,8 +1015,10 @@ def patch_vllm_for_tpu() -> None:
                                         try:
                                             candidate_pg = ray.util.get_placement_group(name)
                                             if candidate_pg is not None:
-                                                num_bundles = len(getattr(candidate_pg, "bundle_specs", []))
-                                                if num_bundles >= parallel_config.world_size:
+                                                bundle_specs = getattr(candidate_pg, "bundle_specs", [])
+                                                if len(bundle_specs) >= parallel_config.world_size and any(
+                                                    "TPU" in b for b in bundle_specs
+                                                ):
                                                     if replica_prefix and replica_prefix in str(name):
                                                         curr_pg = candidate_pg
                                                         break
@@ -1027,6 +1030,36 @@ def patch_vllm_for_tpu() -> None:
                                     curr_pg = fallback_pg
                             except Exception:
                                 pass
+                        if curr_pg is None:
+                            try:
+                                curr_node_id = ray.get_runtime_context().get_node_id()
+                                curr_ip = ray.util.get_node_ip_address().strip("[]")
+                                curr_node = next(
+                                    (n for n in ray.nodes() if n.get("NodeID") == curr_node_id and n.get("Alive")),
+                                    None,
+                                )
+                                node_res = curr_node.get("Resources", {}) if curr_node else {}
+                                slice_res = next(
+                                    (r for r in sorted(node_res) if re.match(r"^tpu-.*group-\d+$", r)),
+                                    None,
+                                )
+                                is_single_host_slice = node_res.get("TPU", 0) >= parallel_config.world_size
+                                pg_strategy = "STRICT_PACK" if is_single_host_slice else "PACK"
+                                if slice_res:
+                                    pg_specs = [
+                                        {"TPU": 1.0, slice_res: 0.001} for _ in range(parallel_config.world_size)
+                                    ]
+                                    curr_pg = ray.util.placement_group(pg_specs, strategy=pg_strategy)
+                                    ray.get(curr_pg.ready(), timeout=180)
+                                elif is_single_host_slice and curr_ip:
+                                    pg_specs = [
+                                        {"TPU": 1.0, f"node:{curr_ip}": 0.001}
+                                        for _ in range(parallel_config.world_size)
+                                    ]
+                                    curr_pg = ray.util.placement_group(pg_specs, strategy="STRICT_PACK")
+                                    ray.get(curr_pg.ready(), timeout=180)
+                            except Exception as pg_err:
+                                logger.warning(f"Failed to create slice-pinned vLLM TPU placement group: {pg_err}")
                     parallel_config.placement_group = curr_pg
                 try:
                     return orig_init_ray_cluster(parallel_config, *args, **kwargs)
@@ -1836,7 +1869,7 @@ async def launch_tpu_vllm_servers(replica) -> None:
             pass
 
     flags_to_copy = set()
-    for flag_var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS"):
+    for flag_var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS", "TPU_SLICE_BUILDER_HEARTBEAT_INTERVAL"):
         base_value = platform_env_vars.get(flag_var) or tpu_env_vars.get(flag_var)
         extra_value = os.environ.get(f"VERL_TPU_EXTRA_{flag_var}")
         resolved = " ".join(v for v in (base_value, extra_value) if v)

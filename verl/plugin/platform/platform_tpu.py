@@ -302,6 +302,8 @@ class PlatformTPU(PlatformCUDA):
         super().__init__()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         self._device_module = TPUDeviceModuleProxy(original_tpu)
+        self._assigned_trainer_slices: set[str] = set()
+        self._rollout_pool_counter: int = 0
 
     @property
     def vendor_name(self) -> str:
@@ -474,7 +476,12 @@ class PlatformTPU(PlatformCUDA):
 
         return env_vars
 
-    def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
+    def auto_assign_accelerator_type(
+        self,
+        name_prefix: str,
+        accelerator_type: Optional[str],
+        process_on_nodes: Optional[list[int]] = None,
+    ) -> Optional[str]:
         """Dynamically assign a TPU slice/group or node affinity to a resource pool on multi-slice clusters."""
         if accelerator_type is not None:
             return accelerator_type
@@ -484,23 +491,75 @@ class PlatformTPU(PlatformCUDA):
 
         try:
             if ray.is_initialized():
-                tpu_nodes = [n for n in ray.nodes() if n.get("Alive") and "TPU" in n.get("Resources", {})]
-                tpu_slices = sorted(
-                    {res for n in tpu_nodes for res in n.get("Resources", {}) if res.startswith("tpu-group-")},
+                excluded_ips = {
+                    ip.strip()
+                    for ip in os.environ.get("VERL_TPU_EXCLUDE_NODE_IPS", "").split(",")
+                    if ip.strip()
+                }
+                tpu_nodes = [
+                    n
+                    for n in ray.nodes()
+                    if n.get("Alive")
+                    and "TPU" in n.get("Resources", {})
+                    and n.get("NodeManagerAddress") not in excluded_ips
+                ]
+                if not tpu_nodes:
+                    return accelerator_type
+
+                # Build unified list of TPU slice descriptors: (slice_id, num_hosts, chips_per_host)
+                group_to_nodes: dict[str, list[dict]] = {}
+                single_host_nodes: list[dict] = []
+                for n in tpu_nodes:
+                    res = n.get("Resources", {})
+                    group_keys = [r for r in res if re.match(r"^tpu-.*group-\d+$", r)]
+                    if group_keys:
+                        for gk in group_keys:
+                            group_to_nodes.setdefault(gk, []).append(n)
+                    elif n.get("NodeManagerAddress"):
+                        single_host_nodes.append(n)
+
+                slice_descriptors: list[tuple[str, int, int]] = []
+                sorted_groups = sorted(
+                    group_to_nodes,
                     key=lambda s: (0, int(s.rsplit("-", 1)[-1])) if s.rsplit("-", 1)[-1].isdigit() else (1, s),
                 )
-                if not tpu_slices:
-                    # Single-host slices (numOfHosts=1) omit tpu-group-* resources; pin by node:<ip> instead.
-                    tpu_slices = sorted(
-                        f"node:{n['NodeManagerAddress']}" for n in tpu_nodes if n.get("NodeManagerAddress")
-                    )
-                if tpu_slices:
-                    if is_rollout_pool and len(tpu_slices) >= 2:
-                        rollout_slices = tpu_slices[1:]
-                        match = re.search(r"(?:rollout_pool(?:_reward|_teacher)?_)(\d+)", prefix_lower)
-                        replica_idx = int(match.group(1)) if match else 0
-                        return rollout_slices[replica_idx % len(rollout_slices)]
-                    return tpu_slices[0]
+                for gk in sorted_groups:
+                    gnodes = group_to_nodes[gk]
+                    cph = int(max(gn.get("Resources", {}).get("TPU", 0) for gn in gnodes))
+                    slice_descriptors.append((gk, len(gnodes), cph))
+                for n in sorted(single_host_nodes, key=lambda x: x["NodeManagerAddress"]):
+                    cph = int(n.get("Resources", {}).get("TPU", 0))
+                    slice_descriptors.append((f"node:{n['NodeManagerAddress']}", 1, cph))
+
+                if not slice_descriptors:
+                    return accelerator_type
+
+                if process_on_nodes:
+                    req_hosts = len(process_on_nodes)
+                    req_cph = max(process_on_nodes)
+                    matching = [s for s, nh, cph in slice_descriptors if nh == req_hosts and cph >= req_cph]
+                else:
+                    matching = []
+                if not matching:
+                    matching = [s for s, _, _ in slice_descriptors]
+
+                if not is_rollout_pool:
+                    chosen = next((s for s in matching if s not in self._assigned_trainer_slices), matching[0])
+                    self._assigned_trainer_slices.add(chosen)
+                    return chosen
+
+                rollout_candidates = [s for s in matching if s not in self._assigned_trainer_slices]
+                if not rollout_candidates:
+                    rollout_candidates = matching[1:] if len(matching) >= 2 else matching
+
+                m = re.search(r"_(\d+)(?:_|$)", prefix_lower)
+                if m is not None:
+                    replica_idx = int(m.group(1))
+                else:
+                    replica_idx = self._rollout_pool_counter
+                    self._rollout_pool_counter += 1
+
+                return rollout_candidates[replica_idx % len(rollout_candidates)]
         except Exception:
             pass
 
@@ -560,7 +619,11 @@ class PlatformTPU(PlatformCUDA):
         have to be named to survive. The caller appends VERL_TPU_EXTRA_<VAR> and
         falls back to the value forwarded off the worker.
         """
-        env_vars = {var: os.environ[var] for var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS") if os.environ.get(var)}
+        env_vars = {
+            var: os.environ[var]
+            for var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS", "TPU_SLICE_BUILDER_HEARTBEAT_INTERVAL")
+            if os.environ.get(var)
+        }
         env_vars["LIBTPU_INIT_ARGS"] = _ensure_slicebuilder_insecure_grpc(env_vars.get("LIBTPU_INIT_ARGS", ""))
         return env_vars
 
@@ -580,6 +643,8 @@ class PlatformTPU(PlatformCUDA):
             "VERL_FILE_LOGGER_ROOT",
             "VERL_FILE_LOGGER_PATH",
             "TENSORBOARD_DIR",
+            "TPU_SLICE_BUILDER_HEARTBEAT_INTERVAL",
+            "VERL_TPU_EXCLUDE_NODE_IPS",
         ):
             if os.environ.get(key):
                 env_vars[key] = os.environ[key]

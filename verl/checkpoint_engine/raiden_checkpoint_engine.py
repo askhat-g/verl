@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import gc
 import logging
 import os
 import time
@@ -868,8 +869,15 @@ class RaidenCheckpointEngine(CheckpointEngine):
         """
         if not self.release_buffers_after_sync or self._trainer_raiden_ws is None:
             return {}
-        self._trainer_raiden_ws.unbind_weights()
-        self._bound_tensors = None
+        if hasattr(self._trainer_raiden_ws, "unbind_weights"):
+            self._trainer_raiden_ws.unbind_weights()
+            self._bound_tensors = None
+        else:
+            ws, self._trainer_raiden_ws = self._trainer_raiden_ws, None
+            self._bound_tensors = None
+            self._registered_signature = None
+            del ws
+            gc.collect()
         # No empty_cache(): on TPU it clears the eager-op compilation cache (forcing recompiles) and the
         # TPU runtime reuses freed HBM without it.
         try:

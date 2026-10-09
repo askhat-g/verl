@@ -56,8 +56,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         train_batch_size = config.data.train_batch_size
         ppo_mini_batch_size = config.actor_rollout_ref.actor.ppo_mini_batch_size
         parameter_sync_step = config.trainer.v1.separate_async.parameter_sync_step
-        assert train_batch_size == parameter_sync_step * ppo_mini_batch_size, (
-            f"train_batch_size must equal parameter_sync_step * ppo_mini_batch_size in separate async "
+        assert train_batch_size % (parameter_sync_step * ppo_mini_batch_size) == 0, (
+            f"train_batch_size must be divisible by parameter_sync_step * ppo_mini_batch_size in separate async "
             f"training, but got train_batch_size={train_batch_size}, "
             f"parameter_sync_step={parameter_sync_step}, ppo_mini_batch_size={ppo_mini_batch_size}"
         )
@@ -200,7 +200,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         """
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
         bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-        if not self._enable_hybrid_replicas or bypass_recomputing_logprobs:
+        if self.parameter_sync_step <= 1 or bypass_recomputing_logprobs:
             return super()._compute_old_log_prob(batch, metrics)
 
         if self.local_trigger_step == 0:

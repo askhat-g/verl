@@ -134,7 +134,9 @@ class RayResourcePool(ResourcePool):
         self.pgs = None
         self.detached = detached
         if accelerator_type is None and get_platform().device_name == "tpu":
-            accelerator_type = get_platform().auto_assign_accelerator_type(self.name_prefix, accelerator_type)
+            accelerator_type = get_platform().auto_assign_accelerator_type(
+                self.name_prefix, accelerator_type, process_on_nodes=self._store
+            )
         self.accelerator_type = accelerator_type
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):

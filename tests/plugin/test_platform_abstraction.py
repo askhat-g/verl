@@ -14,6 +14,7 @@ from verl.plugin.platform.platform_manager import (
     _create_platform,
     _detect_platform_name,
 )
+from verl.plugin.platform.platform_tpu import PlatformTPU
 
 
 def _make_mock_platform(name="mock_xpu"):
@@ -206,6 +207,108 @@ class TestPlatformRegistry:
     def test_unregistered_platform_raises(self):
         with pytest.raises(ValueError):
             _create_platform("nonexistent_platform")
+
+
+class TestPlatformTPUSliceAssignment:
+    """Test PlatformTPU.auto_assign_accelerator_type across single-host, multi-host, and hybrid TPU clusters."""
+
+    def test_explicit_accelerator_type_preserved(self):
+        ptpu = PlatformTPU()
+        assert ptpu.auto_assign_accelerator_type("rollout_pool_0", "tpu-group-9", [8]) == "tpu-group-9"
+
+    def test_homogeneous_multihost_slices(self):
+        fake_nodes = [
+            {"Alive": True, "NodeManagerAddress": "10.0.0.1", "Resources": {"TPU": 4.0, "tpu-group-0": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.0.0.2", "Resources": {"TPU": 4.0, "tpu-group-0": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.0.1.1", "Resources": {"TPU": 4.0, "tpu-group-1": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.0.1.2", "Resources": {"TPU": 4.0, "tpu-group-1": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.0.2.1", "Resources": {"TPU": 4.0, "tpu-group-2": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.0.2.2", "Resources": {"TPU": 4.0, "tpu-group-2": 1.0}},
+        ]
+        ptpu = PlatformTPU()
+        with (
+            mock.patch("ray.is_initialized", return_value=True),
+            mock.patch("ray.nodes", return_value=fake_nodes),
+        ):
+            assert ptpu.auto_assign_accelerator_type("global_pool", None, [4, 4]) == "tpu-group-0"
+            assert ptpu.auto_assign_accelerator_type("rollout_pool_0", None, [4, 4]) == "tpu-group-1"
+            assert ptpu.auto_assign_accelerator_type("rollout_pool_1", None, [4, 4]) == "tpu-group-2"
+            assert ptpu.auto_assign_accelerator_type("rollout_pool_2", None, [4, 4]) == "tpu-group-1"
+
+    def test_hybrid_multihost_trainer_and_singlehost_8t_rollout_replicas(self):
+        fake_nodes = [
+            {"Alive": True, "NodeManagerAddress": "10.11.0.38", "Resources": {"TPU": 4.0, "tpu-group-0": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.39", "Resources": {"TPU": 4.0, "tpu-group-0": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.40", "Resources": {"TPU": 4.0, "tpu-group-1": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.41", "Resources": {"TPU": 4.0, "tpu-group-1": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.50", "Resources": {"TPU": 8.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.55", "Resources": {"TPU": 8.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.61", "Resources": {"TPU": 8.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.62", "Resources": {"TPU": 8.0}},
+        ]
+        ptpu = PlatformTPU()
+        with (
+            mock.patch("ray.is_initialized", return_value=True),
+            mock.patch("ray.nodes", return_value=fake_nodes),
+        ):
+            # Trainer requests [4, 4] -> matched to 2-host tpu-group-0
+            assert ptpu.auto_assign_accelerator_type("global_pool", None, [4, 4]) == "tpu-group-0"
+            # Rollout replicas request [8] -> matched to single-host 8-chip nodes
+            assert ptpu.auto_assign_accelerator_type("rollout_pool_0", None, [8]) == "node:10.11.0.50"
+            assert ptpu.auto_assign_accelerator_type("rollout_pool_1", None, [8]) == "node:10.11.0.55"
+            assert ptpu.auto_assign_accelerator_type("rollout_pool_2", None, [8]) == "node:10.11.0.61"
+            assert ptpu.auto_assign_accelerator_type("rollout_pool_3", None, [8]) == "node:10.11.0.62"
+
+    def test_kuberay_tpu_8t_group_resources(self):
+        fake_nodes = [
+            {"Alive": True, "NodeManagerAddress": "10.11.0.38", "Resources": {"TPU": 4.0, "tpu-group-0": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.39", "Resources": {"TPU": 4.0, "tpu-group-0": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.40", "Resources": {"TPU": 4.0, "tpu-group-1": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.41", "Resources": {"TPU": 4.0, "tpu-group-1": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.50", "Resources": {"TPU": 8.0, "tpu-8t-group-0": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.55", "Resources": {"TPU": 8.0, "tpu-8t-group-1": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.61", "Resources": {"TPU": 8.0, "tpu-8t-group-2": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.11.0.62", "Resources": {"TPU": 8.0, "tpu-8t-group-3": 1.0}},
+        ]
+        ptpu = PlatformTPU()
+        with (
+            mock.patch("ray.is_initialized", return_value=True),
+            mock.patch("ray.nodes", return_value=fake_nodes),
+        ):
+            assert ptpu.auto_assign_accelerator_type("global_pool", None, [4, 4]) == "tpu-group-0"
+            assert ptpu.auto_assign_accelerator_type("rollout_pool_0", None, [8]) == "tpu-8t-group-0"
+            assert ptpu.auto_assign_accelerator_type("rollout_pool_1", None, [8]) == "tpu-8t-group-1"
+            assert ptpu.auto_assign_accelerator_type("rollout_pool_2", None, [8]) == "tpu-8t-group-2"
+            assert ptpu.auto_assign_accelerator_type("rollout_pool_3", None, [8]) == "tpu-8t-group-3"
+
+    def test_heartbeat_interval_forwarded_in_env_vars(self):
+        ptpu = PlatformTPU()
+        with mock.patch.dict(
+            os.environ,
+            {"TPU_SLICE_BUILDER_HEARTBEAT_INTERVAL": "300s", "LIBTPU_INIT_ARGS": "--foo=bar"},
+            clear=False,
+        ):
+            rollout_vars = ptpu.rollout_env_vars()
+            assert rollout_vars["TPU_SLICE_BUILDER_HEARTBEAT_INTERVAL"] == "300s"
+            assert "--foo=bar" in rollout_vars["LIBTPU_INIT_ARGS"]
+            assert "--slicebuilder_use_insecure_grpc=true" in rollout_vars["LIBTPU_INIT_ARGS"]
+            ray_kwargs = ptpu.get_ray_init_kwargs()
+            assert ray_kwargs["runtime_env"]["env_vars"]["TPU_SLICE_BUILDER_HEARTBEAT_INTERVAL"] == "300s"
+
+    def test_exclude_node_ips_in_auto_assign(self):
+        fake_nodes = [
+            {"Alive": True, "NodeManagerAddress": "10.204.17.9", "Resources": {"TPU": 8.0, "tpu-8t-group-0": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.204.15.12", "Resources": {"TPU": 8.0, "tpu-8t-group-1": 1.0}},
+            {"Alive": True, "NodeManagerAddress": "10.204.8.5", "Resources": {"TPU": 8.0, "tpu-8t-group-2": 1.0}},
+        ]
+        ptpu = PlatformTPU()
+        with (
+            mock.patch("ray.is_initialized", return_value=True),
+            mock.patch("ray.nodes", return_value=fake_nodes),
+            mock.patch.dict(os.environ, {"VERL_TPU_EXCLUDE_NODE_IPS": "10.204.17.9"}, clear=False),
+        ):
+            assert ptpu.auto_assign_accelerator_type("rollout_pool_0", None, [8]) == "tpu-8t-group-1"
+            assert ptpu.auto_assign_accelerator_type("rollout_pool_1", None, [8]) == "tpu-8t-group-2"
 
 
 if __name__ == "__main__":

@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import gc
 import os
+import sys
+import types
 
 import pytest
 
@@ -67,3 +70,77 @@ def test_async_bridge_loop_reused_between_calls():
         assert tqu._ASYNC_BRIDGE_LOOP is first_loop
     finally:
         tqu._shutdown_async_bridge_runtime()
+
+
+def test_patch_transfer_queue_clear_order_samples_and_partition(monkeypatch):
+    """Verify patched clear methods clear storage units BEFORE releasing controller global_indexes."""
+    events: list[str] = []
+
+    class FakeStorageManager:
+        async def clear_data(self, metadata):
+            events.append(f"storage.clear_data:{metadata.size}")
+
+    class FakeAsyncTransferQueueClient:
+        def __init__(self):
+            self.client_id = "test_client"
+            self.storage_manager = FakeStorageManager()
+            self._controller = object()
+            self.rebound = 0
+
+        async def _clear_meta_in_controller(self, metadata):
+            events.append(f"controller.clear_meta:{metadata.size}")
+
+        async def _get_partition_meta(self, partition_id: str):
+            events.append(f"controller.get_partition_meta:{partition_id}")
+            if partition_id == "empty_part":
+                return None
+            return types.SimpleNamespace(size=4)
+
+        async def _clear_partition_in_controller(self, partition_id: str):
+            events.append(f"controller.clear_partition:{partition_id}")
+
+        def _bind_sync_methods(self):
+            self.rebound += 1
+
+    existing_client = FakeAsyncTransferQueueClient()
+
+    fake_client_mod = types.ModuleType("transfer_queue.client")
+    fake_client_mod.AsyncTransferQueueClient = FakeAsyncTransferQueueClient
+    fake_interface_mod = types.ModuleType("transfer_queue.interface")
+    fake_interface_mod._TQ_CLIENT = existing_client
+    fake_tq_pkg = types.ModuleType("transfer_queue")
+    fake_tq_pkg.client = fake_client_mod
+    fake_tq_pkg.interface = fake_interface_mod
+
+    monkeypatch.setitem(sys.modules, "transfer_queue", fake_tq_pkg)
+    monkeypatch.setitem(sys.modules, "transfer_queue.client", fake_client_mod)
+    monkeypatch.setitem(sys.modules, "transfer_queue.interface", fake_interface_mod)
+
+    assert tqu.patch_transfer_queue_clear_order() is True
+    assert getattr(FakeAsyncTransferQueueClient, "_verl_clear_order_patched", False) is True
+    assert existing_client.rebound == 1
+
+    # 1. Non-empty clear_samples must clear storage unit BEFORE controller metadata
+    events.clear()
+    asyncio.run(existing_client.async_clear_samples(types.SimpleNamespace(size=16)))
+    assert events == ["storage.clear_data:16", "controller.clear_meta:16"]
+
+    # 2. Empty metadata (size == 0) is a safe no-op
+    events.clear()
+    asyncio.run(existing_client.async_clear_samples(types.SimpleNamespace(size=0)))
+    assert events == []
+
+    # 3. clear_partition must clear storage unit BEFORE controller partition metadata
+    events.clear()
+    asyncio.run(existing_client.async_clear_partition("train"))
+    assert events == [
+        "controller.get_partition_meta:train",
+        "storage.clear_data:4",
+        "controller.clear_partition:train",
+    ]
+
+    # 4. Non-existent partition is a safe no-op after _get_partition_meta
+    events.clear()
+    asyncio.run(existing_client.async_clear_partition("empty_part"))
+    assert events == ["controller.get_partition_meta:empty_part"]
+

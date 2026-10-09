@@ -68,6 +68,93 @@ from verl.utils import tensordict_utils as tu
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+
+def patch_transfer_queue_clear_order() -> bool:
+    """Patch TransferQueueClient to clear storage units before releasing controller global_indexes.
+
+    In TransferQueue <= 0.1.9, ``AsyncTransferQueueClient.async_clear_samples`` and
+    ``async_clear_partition`` clear controller metadata (which immediately releases
+    ``global_indexes`` into ``reusable_indexes``) BEFORE ``storage_manager.clear_data``
+    removes the entries from remote ``SimpleStorageUnit`` actors. Under concurrent
+    rollout (``AgentLoopWorkerTQ.async_kv_batch_put``), a worker can allocate a recycled
+    ``global_index`` and write ``PUT_DATA`` before the trainer's cross-node ``CLEAR_DATA``
+    arrives, causing the delayed ``CLEAR_DATA`` to delete the newly written entry.
+    Reversing the order (storage units first, controller metadata second) prevents any
+    ``global_index`` from being reused until all storage units have cleared it.
+    """
+    try:
+        import transfer_queue.interface as tq_interface
+        from transfer_queue.client import AsyncTransferQueueClient
+    except ImportError:
+        return False
+
+    if not getattr(AsyncTransferQueueClient, "_verl_clear_order_patched", False):
+
+        async def _safe_async_clear_samples(self, metadata: BatchMeta):
+            try:
+                if not hasattr(self, "storage_manager") or self.storage_manager is None:
+                    raise RuntimeError(
+                        f"[{self.client_id}]: Storage manager not initialized. "
+                        "Call initialize_storage_manager() before performing storage operations."
+                    )
+
+                if metadata.size == 0:
+                    logger.warning(f"[{self.client_id}]: Empty BatchMeta provided to clear_samples. No action taken.")
+                    return
+
+                if not self._controller:
+                    raise RuntimeError("No controller registered")
+
+                # Clear storage unit data FIRST so global_indexes are not recycled while CLEAR_DATA is in flight.
+                await self.storage_manager.clear_data(metadata)
+
+                # Clear controller metadata SECOND (releases global_indexes to reusable_indexes).
+                await self._clear_meta_in_controller(metadata)
+
+                logger.debug(f"[{self.client_id}]: Clear operation for batch {metadata} completed.")
+            except Exception as e:
+                raise RuntimeError(f"Error in clear_samples operation: {str(e)}") from e
+
+        async def _safe_async_clear_partition(self, partition_id: str):
+            try:
+                if not hasattr(self, "storage_manager") or self.storage_manager is None:
+                    raise RuntimeError(
+                        f"[{self.client_id}]: Storage manager not initialized. "
+                        "Call initialize_storage_manager() before performing storage operations."
+                    )
+
+                if not self._controller:
+                    raise RuntimeError("No controller registered")
+
+                metadata = await self._get_partition_meta(partition_id)
+
+                if not metadata:
+                    logger.warning(f"Try to clear an non-exist partition {partition_id}. No action will be taken.")
+                    return
+
+                # Clear storage unit data FIRST before releasing partition global_indexes on the controller.
+                await self.storage_manager.clear_data(metadata)
+
+                # Clear controller metadata SECOND (releases global_indexes to reusable_indexes).
+                await self._clear_partition_in_controller(partition_id)
+
+                logger.debug(f"[{self.client_id}]: Clear operation for partition_id {partition_id} completed.")
+            except Exception as e:
+                raise RuntimeError(f"Error in clear operation: {str(e)}") from e
+
+        AsyncTransferQueueClient.async_clear_samples = _safe_async_clear_samples
+        AsyncTransferQueueClient.async_clear_partition = _safe_async_clear_partition
+        AsyncTransferQueueClient._verl_clear_order_patched = True
+
+    existing_client = getattr(tq_interface, "_TQ_CLIENT", None)
+    if existing_client is not None and hasattr(existing_client, "_bind_sync_methods"):
+        existing_client._bind_sync_methods()
+
+    return True
+
+
+patch_transfer_queue_clear_order()
+
 TQ_INITIALIZED = False
 _ASYNC_BRIDGE_LOOP: asyncio.AbstractEventLoop | None = None
 _ASYNC_BRIDGE_THREAD: threading.Thread | None = None

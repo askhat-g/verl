@@ -17,6 +17,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from verl import DataProto
+import verl.utils.seqlen_balancing as seqlen_balancing
 from verl.utils.device import get_device_name, get_nccl_backend, get_torch_device
 from verl.utils.model import create_random_mask
 from verl.utils.seqlen_balancing import (
@@ -337,3 +338,41 @@ def test_group_balanced_partitions_equal_size():
         for uid in uids_in_partition:
             uid_indices = [i for i, u in enumerate(uid_list) if u == uid]
             assert all(i in partition for i in uid_indices)
+
+
+def test_rearrange_micro_batches_tpu_sync_uses_cpu_tensors(monkeypatch):
+    """Verify MAX/MIN metadata all_reduce calls use CPU tensors when get_device_name() == 'tpu'."""
+    monkeypatch.setattr(seqlen_balancing, "get_device_name", lambda: "tpu")
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+
+    recorded_devices = []
+    recorded_ops = []
+
+    def fake_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None):
+        recorded_devices.append(tensor.device.type)
+        recorded_ops.append(op)
+        # Simulate another DP rank failing the initial within_limit check once, forcing upward search
+        if op == dist.ReduceOp.MIN and recorded_ops.count(dist.ReduceOp.MIN) == 1:
+            tensor.zero_()
+
+    monkeypatch.setattr(dist, "all_reduce", fake_all_reduce)
+
+    # 4 samples of length 6 each (total=24), max_token_len=12 -> initial ceildiv(24, 12) = 2 micro-batches,
+    # fake_all_reduce forces 1 retry -> 3 micro-batches.
+    attention_mask = torch.ones((4, 6), dtype=torch.long)
+    batch = DataProto.from_single_dict(
+        {"input_ids": torch.zeros_like(attention_mask), "attention_mask": attention_mask}
+    ).batch
+
+    micro_batches, _ = seqlen_balancing.rearrange_micro_batches(
+        batch,
+        max_token_len=12,
+        dp_group=object(),
+        same_micro_num_in_dp=True,
+    )
+
+    assert len(micro_batches) == 3
+    # 1) num_micro_batches (MAX), 2) constraints (MAX), 3) within_limit #1 (MIN), 4) within_limit #2 (MIN)
+    assert len(recorded_devices) == 4
+    assert all(dev == "cpu" for dev in recorded_devices)
+    assert recorded_ops == [dist.ReduceOp.MAX, dist.ReduceOp.MAX, dist.ReduceOp.MIN, dist.ReduceOp.MIN]

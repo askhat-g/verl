@@ -196,6 +196,89 @@ class TestHybridEngineDisabled:
         trainer.standalone_checkpoint_manager.update_weights.assert_called_once()
         trainer.checkpoint_manager.update_weights.assert_not_called()
 
+    def test_multi_minibatch_divisibility_accepted_and_non_divisible_rejected(self, monkeypatch):
+        def make_cfg(train_bsz, mini_bsz, sync_step):
+            return OmegaConf.create(
+                {
+                    "data": {"train_batch_size": train_bsz},
+                    "actor_rollout_ref": {
+                        "hybrid_engine": False,
+                        "actor": {"ppo_mini_batch_size": mini_bsz},
+                        "rollout": {
+                            "nnodes": 1,
+                            "n_gpus_per_node": 8,
+                            "checkpoint_engine": {"backend": "raiden"},
+                            "disaggregation": {"enabled": False},
+                        },
+                    },
+                    "trainer": {
+                        "v1": {
+                            "separate_async": {
+                                "parameter_sync_step": sync_step,
+                                "hybrid_rollout": {
+                                    "_target_": "verl.trainer.config.HybridRolloutSwitchConfig",
+                                    "enable_switch": False,
+                                },
+                            }
+                        }
+                    },
+                    "reward": {"reward_model": {"enable": False}},
+                }
+            )
+
+        def mock_base_init(trainer, trainer_config):
+            trainer.config = trainer_config
+            trainer.parameter_sync_step = trainer_config.trainer.v1.separate_async.parameter_sync_step
+
+        monkeypatch.setattr(separate_async_module.PPOTrainer, "__init__", mock_base_init)
+
+        # DAPO 1:1 batch sizing: 512 prompts = 16 mini-batches of 32 per single sync step
+        trainer = PPOTrainerSeparateAsync(make_cfg(512, 32, 1))
+        assert trainer.parameter_sync_step == 1
+
+        # Non-divisible batch size must still fail fast
+        with pytest.raises(AssertionError, match="divisible"):
+            PPOTrainerSeparateAsync(make_cfg(500, 32, 1))
+
+    def test_compute_old_log_prob_guards_on_parameter_sync_step(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            PPOTrainer,
+            "_compute_old_log_prob",
+            lambda self, batch, metrics: calls.append(("super_compute", self.local_trigger_step)) or batch,
+        )
+
+        trainer = _make_trainer(enable_hybrid_replicas=False)
+        trainer.config = OmegaConf.create({"algorithm": {}})
+        trainer.actor_rollout_wg = SimpleNamespace(
+            save_model_to_cpu=lambda step: calls.append(("save", step)),
+            restore_model_from_cpu=lambda step: calls.append(("restore", step)),
+            clear_cpu_model=lambda step: calls.append(("clear", step)),
+        )
+
+        # 1. parameter_sync_step == 1: skips CPU save/restore (single compute before train_mini_batch)
+        trainer.parameter_sync_step = 1
+        trainer.local_trigger_step = 0
+        trainer._compute_old_log_prob("batch0", {})
+        assert calls == [("super_compute", 0)]
+
+        # 2. parameter_sync_step > 1 with hybrid_engine=False: must still anchor pi_old via CPU save/restore
+        calls.clear()
+        trainer.parameter_sync_step = 4
+        trainer.local_trigger_step = 0
+        trainer._compute_old_log_prob("batch0", {})
+        trainer.local_trigger_step = 1
+        trainer._compute_old_log_prob("batch1", {})
+        assert calls == [
+            ("save", 0),
+            ("super_compute", 0),
+            ("save", 1),
+            ("restore", 0),
+            ("super_compute", 1),
+            ("restore", 1),
+            ("clear", 1),
+        ]
+
 
 class TestFractionalWarmup:
     def _warmup_stub(self, *, train_batch_size=64, gen_batch_size=None, restored=0):

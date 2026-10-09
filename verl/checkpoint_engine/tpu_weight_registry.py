@@ -47,18 +47,21 @@ class TPUWeightRegistry:
         return self.peers
 
     def set_stats(self, step, stats):
+        self.stats.pop(step, None)
         self.stats[step] = {"master": stats} if "master" not in stats else stats
         self._prune_stats()
 
     def set_rank_stats(self, step, rank, stats):
         """Store one rank's partial stats; the reader merges them once every rank has posted."""
-        self.stats.setdefault(step, {}).setdefault("ranks", {})[rank] = stats
+        entry = self.stats.pop(step, {})
+        entry.setdefault("ranks", {})[rank] = stats
+        self.stats[step] = entry
         self._prune_stats()
 
     def _prune_stats(self):
-        steps_to_keep = sorted(self.stats.keys())
-        if len(steps_to_keep) > 5:
-            for old_step in steps_to_keep[:-5]:
+        steps_in_order = list(self.stats.keys())
+        if len(steps_in_order) > 5:
+            for old_step in steps_in_order[:-5]:
                 del self.stats[old_step]
 
     def get_stats(self, step):

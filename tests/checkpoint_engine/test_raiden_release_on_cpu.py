@@ -67,3 +67,20 @@ def test_release_is_noop_before_first_sync():
     engine._trainer_raiden_ws = None
 
     assert engine.release_sync_buffers() == {}
+
+
+def test_release_falls_back_when_unbind_weights_missing():
+    class _LegacyWeightSynchronizer:
+        pass
+
+    engine = RaidenCheckpointEngine.__new__(RaidenCheckpointEngine)
+    engine.release_buffers_after_sync = True
+    engine._trainer_raiden_ws = _LegacyWeightSynchronizer()
+    engine._registered_signature = [("w", (2, 2), "bf16", None)]
+    engine._bound_tensors = [object()]
+
+    assert engine.release_sync_buffers() == {}
+    assert engine._trainer_raiden_ws is None
+    assert engine._bound_tensors is None
+    assert engine._registered_signature is None
+
