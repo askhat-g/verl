@@ -955,10 +955,14 @@ async def update_raiden_weights(
     # controller and does not need to be repeated on every weight sync iteration.
     t_barrier_start = time.perf_counter()
 
-    # One group of destination units per rollout replica: ranks '0'..'TP-1' under the replica's own job name.
-    # Examples:
-    #   - 1 replica with TP=8: one group ['0'..'7'] under job "sampler".
-    #   - 3 replicas with TP=8: groups ['0'..'7'] under "sampler0", "sampler1", "sampler2".
+    # Every rollout replica registers its TP workers as ranks '0'..'TP-1' under its own job name (see
+    # _sampler_job_name). Examples:
+    #   - 1 replica with TP=8: ['0'..'7'] under job "sampler".
+    #   - 3 replicas with TP=8: ['0'..'7'] under each of "sampler0", "sampler1", "sampler2".
+    # All of them go into ONE transfer. Raiden shards a transfer across the units that share a job name and
+    # broadcasts across job names: its planner puts rank k of every replica into one broadcast tree, seeds a
+    # few of them from the trainer and relays between the sampler hosts. One transfer per replica would make
+    # the trainer push every byte once per replica instead.
     num_replicas = len(manager.replicas)
     trainer_replica_ids = [str(i) for i in range(manager.actor_wg.world_size)]
 
@@ -966,14 +970,11 @@ async def update_raiden_weights(
     from tpu_sync.rpc.raiden_controller import RaidenMemoryType
 
     src_units = [RaidenId(job_name="trainer", job_replica_id=r_id, data_name="weights") for r_id in trainer_replica_ids]
-    dst_unit_groups = [
-        [
-            RaidenId(job_name=_sampler_job_name(replica_idx, num_replicas), job_replica_id=str(k), data_name="weights")
-            for k in range(_replica_num_workers(replica))
-        ]
+    dst_units = [
+        RaidenId(job_name=_sampler_job_name(replica_idx, num_replicas), job_replica_id=str(k), data_name="weights")
         for replica_idx, replica in enumerate(manager.replicas)
+        for k in range(_replica_num_workers(replica))
     ]
-    dst_units = [unit for group in dst_unit_groups for unit in group]
 
     if not hasattr(manager, "raiden_controller") or manager.raiden_controller is None:
         raise RuntimeError(
@@ -1003,29 +1004,20 @@ async def update_raiden_weights(
         await asyncio.sleep(0.1)
     t_barrier = time.perf_counter() - t_barrier_start
 
-    # 4. Trigger coordinated P2P network transfers via central RaidenController
+    # 4. Trigger the coordinated P2P transfer via the central RaidenController: one transfer whose destination
+    #    holds the units of every rollout replica (see the note above dst_units).
     t_transfer_start = time.perf_counter()
-    # One transfer per replica. Each has the destination mesh of the validated single-replica case ([1, TP]),
-    # instead of one transfer whose destination mixes the ranks of several meshes. The transfers are issued
-    # together and awaited together: the controller tracks each by its own req_id / uuid and the trainer ranks
-    # keep their D2H and skip-tiling state per uuid, so the replicas overlap instead of paying the per-transfer
-    # latency one after another. The trainer buffers are only released after every transfer has finished.
-    transfer_futures = []
-    for replica_idx, dst_group in enumerate(dst_unit_groups):
-        req_id = f"verl_step_{global_steps or 0}" + (f"_replica{replica_idx}" if num_replicas > 1 else "")
-        transfer_futures.append(
-            manager.raiden_controller.start_transfer(
-                src_units=src_units,
-                dst_units=dst_group,
-                dst_mem_type=RaidenMemoryType.DRAM,
-                use_block_chunks=True,
-                is_sender=True,
-                expected_block_count=0,
-                parallelism=parallelism,
-                req_id=req_id,
-            )
-        )
-    await asyncio.gather(*[future.wait() for future in transfer_futures])
+    transfer_future = manager.raiden_controller.start_transfer(
+        src_units=src_units,
+        dst_units=dst_units,
+        dst_mem_type=RaidenMemoryType.DRAM,
+        use_block_chunks=True,
+        is_sender=True,
+        expected_block_count=0,
+        parallelism=parallelism,
+        req_id=f"verl_step_{global_steps or 0}",
+    )
+    await transfer_future.wait()
     t_transfer = time.perf_counter() - t_transfer_start
 
     # The trainer buffers are no longer read once the transfer is done; free them (unless disabled)
