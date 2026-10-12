@@ -202,6 +202,7 @@ def get_platform_worker_env_vars(
         local_world_size=local_world_size,
         name_prefix=name_prefix,
         pgs=pgs,
+        accelerator_type=getattr(resource_pool, "accelerator_type", None),
     )
     env_vars.update(tpu_env)
     return env_vars

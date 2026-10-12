@@ -72,14 +72,29 @@ TRAIN_FILE="${RAY_DATA_HOME}/data/gsm8k/train.parquet"
 TEST_FILE="${RAY_DATA_HOME}/data/gsm8k/test.parquet"
 
 # TPU 2-slice v6e-8 configurations
-export NNODES_TRAINER=2       # 2 physical VM hosts for training slice
-export N_CHIPS_TRAINER=4      # 4 TPU chips per training host
+export NNODES_TRAINER="${NNODES_TRAINER:-2}"       # 2 physical VM hosts for training slice
+export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-4}"      # 4 TPU chips per training host
 
-export NNODES_ROLLOUT=2       # 2 physical VM hosts for rollout slice
-export N_CHIPS_ROLLOUT=4      # 4 TPU chips per rollout host
+export NNODES_ROLLOUT="${NNODES_ROLLOUT:-2}"       # 2 physical VM hosts for rollout slice(s)
+export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-4}"      # 4 TPU chips per rollout host
 
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
 TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
+
+# Rollout parallelism. By default one TP=8 vLLM replica spans the rollout v6e-8 slice. Several replicas can be
+# asked for in two equivalent ways (see run_qwen3_0_6b_torchtitan.sh): ROLLOUT_DP=<replicas> with matching
+# NNODES_ROLLOUT / N_CHIPS_ROLLOUT, or ROLLOUT_SLICES=1,2 (one TP=8 replica per rollout slice).
+ROLLOUT_TP="${ROLLOUT_TP:-${TOTAL_ROLLOUT_CHIPS}}"
+ROLLOUT_DP="${ROLLOUT_DP:-1}"
+ROLLOUT_SLICES="${ROLLOUT_SLICES:-}"
+TRAINER_SLICES="${TRAINER_SLICES:-}"
+TPU_SLICE_ARGS=()
+if [[ -n "${ROLLOUT_SLICES}" ]]; then
+    TPU_SLICE_ARGS+=("actor_rollout_ref.rollout.tpu_slices=[${ROLLOUT_SLICES}]")
+fi
+if [[ -n "${TRAINER_SLICES}" ]]; then
+    TPU_SLICE_ARGS+=("+trainer.tpu_slices=[${TRAINER_SLICES}]")
+fi
 
 # Sequence budget
 MAX_PROMPT_LEN=512
@@ -149,7 +164,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.torchtitan.attn_type=varlen \
     actor_rollout_ref.actor.torchtitan.activation_checkpoint="${ACTIVATION_CHECKPOINT}" \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.tensor_model_parallel_size="${TOTAL_ROLLOUT_CHIPS}" \
+    actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}" \
+    actor_rollout_ref.rollout.data_parallel_size="${ROLLOUT_DP}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.temperature=1.0 \
@@ -181,4 +197,4 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.nnodes="${NNODES_ROLLOUT}" \
     actor_rollout_ref.rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" \
     +rollout.nnodes="${NNODES_ROLLOUT}" \
-    +rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" "$@"
+    +rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" ${TPU_SLICE_ARGS[@]+"${TPU_SLICE_ARGS[@]}"} "$@"

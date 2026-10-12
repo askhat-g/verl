@@ -74,6 +74,57 @@ def _resolve_tpu_topology_bounds(
     return topology, host_bounds, chips_per_host_bounds, chips_per_host
 
 
+# Hosts (node IPs) planned for this rollout replica by the trainer, and their chip count. Set on the
+# server actor (launch_tpu_vllm_servers) from RayResourcePool.tpu_hosts and inherited by the engine
+# process, where the Ray executor allocates the TPU workers.
+VERL_TPU_ROLLOUT_HOSTS_ENV = "VERL_TPU_ROLLOUT_HOSTS"
+VERL_TPU_CHIPS_PER_HOST_ENV = "VERL_TPU_CHIPS_PER_HOST"
+
+
+def _create_pinned_tpu_placement_group(parallel_config, ray_address=None):
+    """Create vLLM's placement group on the hosts planned for this replica, or return None.
+
+    vLLM otherwise creates a PACK placement group of ``world_size`` ``{"TPU": 1}`` bundles that Ray places
+    on any hosts with free chips. With several replicas, or a multi-host replica next to other slices, that
+    can land a replica's workers on hosts of another slice (no ICI between slices) or on the host another
+    replica's server was pinned to. One ``{"TPU": 1, "node:<ip>": 1e-4}`` bundle per chip of each planned
+    host keeps the workers on exactly those hosts. Falls back to vLLM's default on any problem.
+    """
+    hosts_env = os.environ.get(VERL_TPU_ROLLOUT_HOSTS_ENV, "")
+    hosts = [h.strip() for h in hosts_env.split(",") if h.strip()]
+    if not hosts:
+        return None
+    try:
+        world_size = int(parallel_config.world_size)
+        chips_per_host = int(os.environ.get(VERL_TPU_CHIPS_PER_HOST_ENV) or world_size // len(hosts))
+        if chips_per_host * len(hosts) != world_size:
+            logging.getLogger(__name__).warning(
+                f"[TPU placement] {len(hosts)} planned host(s) x {chips_per_host} chips != vLLM world size "
+                f"{world_size}; letting vLLM place its workers."
+            )
+            return None
+        if not ray.is_initialized():
+            try:
+                ray.init(address=ray_address, runtime_env=getattr(parallel_config, "ray_runtime_env", None))
+            except Exception:
+                ray.init(address="auto")
+        bundles = [{"TPU": 1, f"node:{ip}": 1e-4} for ip in hosts for _ in range(chips_per_host)]
+        pg = ray.util.placement_group(
+            bundles, strategy="PACK", name=f"verl_tpu_rollout_{os.getpid()}_{int(time.time() * 1000)}"
+        )
+        ray.get(pg.ready(), timeout=1800)
+        logging.getLogger(__name__).info(
+            f"[TPU placement] vLLM workers pinned to hosts {hosts} ({chips_per_host} chips each)"
+        )
+        print(f"[TPU placement] vLLM workers pinned to hosts {hosts} ({chips_per_host} chips each)", flush=True)
+        return pg
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"[TPU placement] could not pin vLLM workers to {hosts}: {e}; letting vLLM place its workers."
+        )
+        return None
+
+
 # -------------------------------------------
 
 try:
@@ -979,6 +1030,12 @@ def patch_vllm_for_tpu() -> None:
 
             def patched_initialize_ray_cluster(parallel_config, *args, **kwargs):
                 if parallel_config.placement_group is None:
+                    pinned_pg = _create_pinned_tpu_placement_group(
+                        parallel_config, ray_address=kwargs.get("ray_address") or (args[0] if args else None)
+                    )
+                    if pinned_pg is not None:
+                        parallel_config.placement_group = pinned_pg
+                if parallel_config.placement_group is None:
                     curr_pg = ray.util.get_current_placement_group()
                     if curr_pg is None:
                         pg_name = os.environ.get("VERL_ROLLOUT_PG_NAME")
@@ -1798,13 +1855,11 @@ async def launch_tpu_vllm_servers(replica) -> None:
     if replica.config.data_parallel_size > 1:
         raise NotImplementedError(
             "actor_rollout_ref.rollout.data_parallel_size="
-            f"{replica.config.data_parallel_size} is not supported on TPU. The TPU "
-            "distributed runtime requires each compiled program to span the whole "
-            "TPU mesh, but a single DP group only spans "
-            f"tensor_model_parallel_size={replica.config.tensor_model_parallel_size} "
-            "chips. Set actor_rollout_ref.rollout.data_parallel_size=1 instead: verl "
-            "then creates one rollout replica per tensor_model_parallel_size chips, "
-            "which is equivalent to engine-internal data parallelism."
+            f"{replica.config.data_parallel_size} inside a single TPU replica is not supported. The TPU "
+            "distributed runtime requires each compiled program to span the whole TPU mesh, but a single DP "
+            f"group only spans tensor_model_parallel_size={replica.config.tensor_model_parallel_size} chips. "
+            "LLMServerManager turns data_parallel_size into that many TPU replicas; create replicas through it "
+            "or pass data_parallel_size=1 per replica."
         )
 
     await report_stale_tpu_engines(replica.workers)
@@ -1827,13 +1882,23 @@ async def launch_tpu_vllm_servers(replica) -> None:
     }
     if "VERL_PLATFORM" in os.environ:
         env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
-    if getattr(replica, "resource_pool", None) is not None and getattr(replica.resource_pool, "pgs", None):
+    resource_pool = getattr(replica, "resource_pool", None)
+    if resource_pool is not None and getattr(resource_pool, "pgs", None):
         try:
-            pg_info = ray._private.state.state.placement_group_table(replica.resource_pool.pgs[0].id)
+            pg_info = ray._private.state.state.placement_group_table(resource_pool.pgs[0].id)
             if pg_info and pg_info.get("name"):
                 env_vars["VERL_ROLLOUT_PG_NAME"] = str(pg_info["name"])
         except Exception:
             pass
+    planned_hosts = getattr(resource_pool, "tpu_hosts", None)
+    if planned_hosts:
+        # The engine's Ray executor pins its TPU workers to these hosts (see _create_pinned_tpu_placement_group).
+        env_vars[VERL_TPU_ROLLOUT_HOSTS_ENV] = ",".join(planned_hosts)
+        env_vars[VERL_TPU_CHIPS_PER_HOST_ENV] = str(replica.gpus_per_replica_node)
+        _tpu_preflight_log(
+            f"replica {replica.replica_rank}: slice {resource_pool.accelerator_type}, hosts {planned_hosts}",
+            tag="TPU placement",
+        )
 
     flags_to_copy = set()
     for flag_var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS"):

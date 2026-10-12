@@ -63,9 +63,21 @@ export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-4}"      # TPU chips per rollout host
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
 TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
 
-# Rollout parallelism. By default one vLLM replica spans every rollout chip. Setting ROLLOUT_TP=4 with
-# NNODES_ROLLOUT=2 N_CHIPS_ROLLOUT=4 creates TOTAL_ROLLOUT_CHIPS / ROLLOUT_TP = 2 independent TP=4 vLLM replicas.
+# Rollout parallelism. By default one vLLM replica spans every rollout chip. Several replicas can be asked for in
+# two equivalent ways (see run_qwen3_0_6b_torchtitan.sh): ROLLOUT_TP=4 ROLLOUT_DP=2 with NNODES_ROLLOUT=2
+# N_CHIPS_ROLLOUT=4 (one TP=4 replica per rollout host), or ROLLOUT_SLICES=1,2 ROLLOUT_TP=8 (one TP=8 replica per
+# rollout slice; nnodes / chips are derived from the slices). ROLLOUT_DP=1 keeps TOTAL_ROLLOUT_CHIPS / ROLLOUT_TP.
 ROLLOUT_TP="${ROLLOUT_TP:-${TOTAL_ROLLOUT_CHIPS}}"
+ROLLOUT_DP="${ROLLOUT_DP:-1}"
+ROLLOUT_SLICES="${ROLLOUT_SLICES:-}"
+TRAINER_SLICES="${TRAINER_SLICES:-}"
+TPU_SLICE_ARGS=()
+if [[ -n "${ROLLOUT_SLICES}" ]]; then
+    TPU_SLICE_ARGS+=("actor_rollout_ref.rollout.tpu_slices=[${ROLLOUT_SLICES}]")
+fi
+if [[ -n "${TRAINER_SLICES}" ]]; then
+    TPU_SLICE_ARGS+=("+trainer.tpu_slices=[${TRAINER_SLICES}]")
+fi
 
 # Sequence budget
 MAX_PROMPT_LEN=512
@@ -145,6 +157,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.enable_prefix_caching=False \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.no_enable_prefix_caching=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}" \
+    actor_rollout_ref.rollout.data_parallel_size="${ROLLOUT_DP}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.temperature=1.0 \
@@ -176,4 +189,4 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.nnodes="${NNODES_ROLLOUT}" \
     actor_rollout_ref.rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" \
     +rollout.nnodes="${NNODES_ROLLOUT}" \
-    +rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" "$@"
+    +rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" ${TPU_SLICE_ARGS[@]+"${TPU_SLICE_ARGS[@]}"} "$@"

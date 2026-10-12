@@ -27,6 +27,7 @@ import numpy as np
 import ray
 from omegaconf import DictConfig
 
+from verl.plugin.platform import get_platform
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import normalize_token_ids
 from verl.utils.ray_utils import auto_await
@@ -457,12 +458,28 @@ class LLMServerManager:
             if self.worker_group
             else self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
         )
+        replica_config = self.rollout_config
+        if self.rollout_config.data_parallel_size > 1 and get_platform().device_name == "tpu":
+            # On TPU a compiled program spans the whole mesh of a replica, so there is no engine-internal data
+            # parallelism: data_parallel_size counts vLLM replicas of tensor_model_parallel_size chips each.
+            from verl.plugin.platform.platform_tpu_slices import tpu_replica_rollout_config
+
+            replica_config = tpu_replica_rollout_config(self.rollout_config)
+            rollout_world_size //= self.rollout_config.data_parallel_size
+            expected = self.rollout_config.data_parallel_size * rollout_world_size
+            if world_size != expected:
+                raise ValueError(
+                    f"actor_rollout_ref.rollout.data_parallel_size={self.rollout_config.data_parallel_size} x "
+                    f"tensor_model_parallel_size={self.rollout_config.tensor_model_parallel_size} needs {expected} "
+                    f"rollout chips, but the rollout has {world_size} "
+                    f"(nnodes={self.rollout_config.nnodes} x n_gpus_per_node={self.rollout_config.n_gpus_per_node})."
+                )
         num_replicas = world_size // rollout_world_size
 
         self.rollout_replicas = [
             self.rollout_replica_class(
                 replica_rank=start_rank + replica_rank,
-                config=self.rollout_config,
+                config=replica_config,
                 model_config=self.model_config,
                 gpus_per_node=self.rollout_config.n_gpus_per_node,
             )

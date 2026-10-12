@@ -13,6 +13,12 @@ nnodes: 0
 # Number of GPUs per node for rollout server.
 n_gpus_per_node: ${oc.select:trainer.n_gpus_per_node,8}
 
+# TPU only: slices that host the standalone rollout replicas, as slice indices ([1, 2] -> tpu-group-1, tpu-group-2)
+# or Ray resource names ("tpu-group-1", "node:<ip>"). When set, nnodes / n_gpus_per_node are derived from the slices
+# and the rollout runs chips / tensor_model_parallel_size replicas. Alternatively keep nnodes / n_gpus_per_node and set
+# data_parallel_size = number of replicas (data_parallel_size * tensor_model_parallel_size must equal the rollout chips).
+tpu_slices: null
+
 # Sampling temperature for rollout.
 temperature: 1.0
 

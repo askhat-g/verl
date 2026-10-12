@@ -133,8 +133,13 @@ class RayResourcePool(ResourcePool):
         self.name_prefix = get_random_string(length=6) if name_prefix is None else name_prefix
         self.pgs = None
         self.detached = detached
+        # TPU: node IP of each placement group when the platform pins the pool to specific hosts
+        # (rollout replicas sharing a multi-host slice); None otherwise.
+        self.tpu_hosts: Optional[list[str]] = None
         if accelerator_type is None and get_platform().device_name == "tpu":
-            accelerator_type = get_platform().auto_assign_accelerator_type(self.name_prefix, accelerator_type)
+            accelerator_type, self.tpu_hosts = get_platform().plan_resource_pool_placement(
+                self.name_prefix, process_on_nodes
+            )
         self.accelerator_type = accelerator_type
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
@@ -163,6 +168,8 @@ class RayResourcePool(ResourcePool):
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
+        if get_platform().device_name == "tpu":
+            get_platform().pin_placement_group_scheme(pg_scheme, self.tpu_hosts)
 
         lifetime = "detached" if self.detached else None
 

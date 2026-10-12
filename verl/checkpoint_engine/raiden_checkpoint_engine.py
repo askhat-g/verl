@@ -432,104 +432,109 @@ class RaidenParityCheck:
                 logger.warning(f"[RAIDEN PARITY] Incomplete stats data for step {step_key}")
                 return
 
-            # Unpacks and flattens the results collected from all Sampler rollout replicas into a single flat list
-            # of worker dictionary objects.
-            sampler_workers = [
-                w
-                for res in sampler_entries
-                for w in (res if isinstance(res, list | tuple) else [res])
-                if isinstance(w, dict)
-            ]
-            if not sampler_workers:
-                return
-
             if "ranks" in trainer_entry:
                 trainer_master = merge_rank_stats(trainer_entry["ranks"])
             else:
                 trainer_master = trainer_entry.get("master", trainer_entry)
-            trainer_per_tensor = trainer_master.get("per_tensor", {})
-            # Gets master list of all model tensor names (e.g., "model.layers.0.self_attn.qkv_proj.weight").
-            all_param_names = list(sampler_workers[0].get("per_tensor", {}).keys()) if sampler_workers else []
 
-            total_trainer_numel = trainer_master.get("total_numel", 0)
-            total_trainer_l1 = trainer_master.get("l1_norm", 0.0)
-            global_trainer_l2 = trainer_master.get("l2_norm", 0.0)
-
-            total_sampler_l1, total_sampler_l2_sq, total_sampler_numel = 0.0, 0.0, 0
-            mismatches = []
-
-            for name in all_param_names:
-                s_numels = [w.get("per_tensor", {}).get(name, {}).get("numel", 0) for w in sampler_workers]
-                s_l1s = [w.get("per_tensor", {}).get(name, {}).get("l1", 0.0) for w in sampler_workers]
-                s_l2_sqs = [
-                    w.get("per_tensor", {})
-                    .get(name, {})
-                    .get("l2_sq", w.get("per_tensor", {}).get(name, {}).get("l2", 0.0) ** 2)
-                    for w in sampler_workers
-                ]
-                s_replicas = [w.get("per_tensor", {}).get(name, {}).get("replicas") for w in sampler_workers]
-
-                is_replicated = (
-                    len(set(s_numels)) == 1
-                    and (name.endswith("layernorm.weight") or "norm" in name)
-                    and len(s_numels[0:1]) > 0
-                    and s_numels[0] < 10000
-                )
-                if all(r for r in s_replicas):
-                    # Each slice is held by `replicas` ranks (GQA k/v heads, unsharded norms): count it once.
-                    s_agg_numel = round(sum(n / r for n, r in zip(s_numels, s_replicas, strict=True)))
-                    s_agg_l1 = sum(v / r for v, r in zip(s_l1s, s_replicas, strict=True))
-                    s_agg_l2 = sum(v / r for v, r in zip(s_l2_sqs, s_replicas, strict=True)) ** 0.5
-                elif is_replicated:
-                    s_agg_numel = s_numels[0]
-                    s_agg_l1 = s_l1s[0]
-                    s_agg_l2 = s_l2_sqs[0] ** 0.5
-                else:
-                    s_agg_numel = sum(s_numels)
-                    s_agg_l1 = sum(s_l1s)
-                    s_agg_l2 = sum(s_l2_sqs) ** 0.5
-
-                t_data = trainer_per_tensor.get(name, {})
-                t_agg_numel = t_data.get("numel", 0)
-                t_agg_l1 = t_data.get("l1", 0.0)
-
-                total_sampler_numel += s_agg_numel
-                total_sampler_l1 += s_agg_l1
-                total_sampler_l2_sq += s_agg_l2**2
-
-                delta_numel = abs(s_agg_numel - t_agg_numel)
-                delta_l1 = abs(s_agg_l1 - t_agg_l1)
-                rel_tol = 1e-3 * max(abs(t_agg_l1), 1.0)
-
-                if delta_numel != 0 or delta_l1 > rel_tol:
-                    mismatches.append(f"  * {name}: Trainer(L1={t_agg_l1:.4f}) vs Sampler(L1={s_agg_l1:.4f})")
-
-            global_sampler_l2 = total_sampler_l2_sq**0.5
-            total_l1_delta = abs(total_sampler_l1 - total_trainer_l1)
-            total_l2_delta = abs(global_sampler_l2 - global_trainer_l2)
-            total_numel_delta = abs(total_sampler_numel - total_trainer_numel)
-            total_rel_tol = 1e-3 * max(abs(total_trainer_l1), 1.0)
-
-            if not mismatches and total_numel_delta == 0 and total_l1_delta <= total_rel_tol:
-                logger.info(
-                    f"[RAIDEN PARITY VERIFIED | Step {step_key}] 100% DISTRIBUTED NORM PARITY CONFIRMED!\n"
-                    f"  * Global L1 Norm: {total_sampler_l1:.6f} "
-                    f"(Trainer={total_trainer_l1:.6f}, delta={total_l1_delta:.6f})\n"
-                    f"  * Global L2 Norm: {global_sampler_l2:.6f} "
-                    f"(Trainer={global_trainer_l2:.6f}, delta={total_l2_delta:.6f})\n"
-                    f"  * Total Parameters: {total_sampler_numel} across {len(all_param_names)} tensors"
-                )
-            else:
-                mismatches_summary = "\n".join(mismatches[:10])
-                logger.error(
-                    f"[RAIDEN PARITY MISMATCH | Step {step_key}] Norms do NOT match!\n"
-                    f"  * Trainer: numel={total_trainer_numel}, L1={total_trainer_l1:.6f}, L2={global_trainer_l2:.6f}\n"
-                    f"  * Sampler: numel={total_sampler_numel}, L1={total_sampler_l1:.6f}, L2={global_sampler_l2:.6f}\n"
-                    f"  * Mismatched Tensors ({len(mismatches)} / {len(all_param_names)}):\n"
-                    f"{mismatches_summary}"
-                )
+            # Every rollout replica holds a complete copy of the weights, so compare the trainer with each
+            # replica on its own: summing the workers of all replicas would count every tensor once per replica.
+            num_replicas = len(sampler_entries)
+            for replica_idx, res in enumerate(sampler_entries):
+                sampler_workers = [w for w in (res if isinstance(res, list | tuple) else [res]) if isinstance(w, dict)]
+                if not sampler_workers:
+                    logger.warning(f"[RAIDEN PARITY] No sampler stats from replica {replica_idx} for step {step_key}")
+                    continue
+                tag = f"Step {step_key}" + (f" | Replica {replica_idx}" if num_replicas > 1 else "")
+                self._compare_replica_norms(tag, trainer_master, sampler_workers)
         except Exception as e:
             logger.warning(f"Error during parity verification for step {step_key}: {e}")
+
+    @staticmethod
+    def _compare_replica_norms(tag: str, trainer_master: dict, sampler_workers: list[dict]) -> bool:
+        """Compare the trainer's per-tensor norms with those of one replica's TP workers; log the verdict."""
+        trainer_per_tensor = trainer_master.get("per_tensor", {})
+        # Gets master list of all model tensor names (e.g., "model.layers.0.self_attn.qkv_proj.weight").
+        all_param_names = list(sampler_workers[0].get("per_tensor", {}).keys())
+
+        total_trainer_numel = trainer_master.get("total_numel", 0)
+        total_trainer_l1 = trainer_master.get("l1_norm", 0.0)
+        global_trainer_l2 = trainer_master.get("l2_norm", 0.0)
+
+        total_sampler_l1, total_sampler_l2_sq, total_sampler_numel = 0.0, 0.0, 0
+        mismatches = []
+
+        for name in all_param_names:
+            s_numels = [w.get("per_tensor", {}).get(name, {}).get("numel", 0) for w in sampler_workers]
+            s_l1s = [w.get("per_tensor", {}).get(name, {}).get("l1", 0.0) for w in sampler_workers]
+            s_l2_sqs = [
+                w.get("per_tensor", {})
+                .get(name, {})
+                .get("l2_sq", w.get("per_tensor", {}).get(name, {}).get("l2", 0.0) ** 2)
+                for w in sampler_workers
+            ]
+            s_replicas = [w.get("per_tensor", {}).get(name, {}).get("replicas") for w in sampler_workers]
+
+            is_replicated = (
+                len(set(s_numels)) == 1
+                and (name.endswith("layernorm.weight") or "norm" in name)
+                and len(s_numels[0:1]) > 0
+                and s_numels[0] < 10000
+            )
+            if all(r for r in s_replicas):
+                # Each slice is held by `replicas` ranks (GQA k/v heads, unsharded norms): count it once.
+                s_agg_numel = round(sum(n / r for n, r in zip(s_numels, s_replicas, strict=True)))
+                s_agg_l1 = sum(v / r for v, r in zip(s_l1s, s_replicas, strict=True))
+                s_agg_l2 = sum(v / r for v, r in zip(s_l2_sqs, s_replicas, strict=True)) ** 0.5
+            elif is_replicated:
+                s_agg_numel = s_numels[0]
+                s_agg_l1 = s_l1s[0]
+                s_agg_l2 = s_l2_sqs[0] ** 0.5
+            else:
+                s_agg_numel = sum(s_numels)
+                s_agg_l1 = sum(s_l1s)
+                s_agg_l2 = sum(s_l2_sqs) ** 0.5
+
+            t_data = trainer_per_tensor.get(name, {})
+            t_agg_numel = t_data.get("numel", 0)
+            t_agg_l1 = t_data.get("l1", 0.0)
+
+            total_sampler_numel += s_agg_numel
+            total_sampler_l1 += s_agg_l1
+            total_sampler_l2_sq += s_agg_l2**2
+
+            delta_numel = abs(s_agg_numel - t_agg_numel)
+            delta_l1 = abs(s_agg_l1 - t_agg_l1)
+            rel_tol = 1e-3 * max(abs(t_agg_l1), 1.0)
+
+            if delta_numel != 0 or delta_l1 > rel_tol:
+                mismatches.append(f"  * {name}: Trainer(L1={t_agg_l1:.4f}) vs Sampler(L1={s_agg_l1:.4f})")
+
+        global_sampler_l2 = total_sampler_l2_sq**0.5
+        total_l1_delta = abs(total_sampler_l1 - total_trainer_l1)
+        total_l2_delta = abs(global_sampler_l2 - global_trainer_l2)
+        total_numel_delta = abs(total_sampler_numel - total_trainer_numel)
+        total_rel_tol = 1e-3 * max(abs(total_trainer_l1), 1.0)
+
+        if not mismatches and total_numel_delta == 0 and total_l1_delta <= total_rel_tol:
+            logger.info(
+                f"[RAIDEN PARITY VERIFIED | {tag}] 100% DISTRIBUTED NORM PARITY CONFIRMED!\n"
+                f"  * Global L1 Norm: {total_sampler_l1:.6f} "
+                f"(Trainer={total_trainer_l1:.6f}, delta={total_l1_delta:.6f})\n"
+                f"  * Global L2 Norm: {global_sampler_l2:.6f} "
+                f"(Trainer={global_trainer_l2:.6f}, delta={total_l2_delta:.6f})\n"
+                f"  * Total Parameters: {total_sampler_numel} across {len(all_param_names)} tensors"
+            )
+            return True
+        mismatches_summary = "\n".join(mismatches[:10])
+        logger.error(
+            f"[RAIDEN PARITY MISMATCH | {tag}] Norms do NOT match!\n"
+            f"  * Trainer: numel={total_trainer_numel}, L1={total_trainer_l1:.6f}, L2={global_trainer_l2:.6f}\n"
+            f"  * Sampler: numel={total_sampler_numel}, L1={total_sampler_l1:.6f}, L2={global_sampler_l2:.6f}\n"
+            f"  * Mismatched Tensors ({len(mismatches)} / {len(all_param_names)}):\n"
+            f"{mismatches_summary}"
+        )
+        return False
 
 
 def setup_raiden_controller() -> tuple[Any, Any, str]:

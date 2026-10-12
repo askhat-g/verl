@@ -159,6 +159,10 @@ class RolloutConfig(BaseConfig):
     mode: str = "async"
     nnodes: int = 0
     n_gpus_per_node: int = 8
+    # TPU only: slices that host the standalone rollout replicas, as slice indices ([1, 2] -> tpu-group-1,
+    # tpu-group-2) or Ray resource names ("tpu-group-1", "node:<ip>"). When set, nnodes / n_gpus_per_node
+    # are filled in from the slices and the number of replicas is chips / tensor_model_parallel_size.
+    tpu_slices: Optional[list] = None
 
     temperature: float = 1.0
     top_k: int = -1

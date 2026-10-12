@@ -61,6 +61,14 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             f"training, but got train_batch_size={train_batch_size}, "
             f"parameter_sync_step={parameter_sync_step}, ppo_mini_batch_size={ppo_mini_batch_size}"
         )
+        from verl.plugin.platform import get_platform
+
+        if get_platform().device_name == "tpu":
+            # Fill rollout nnodes / n_gpus_per_node from actor_rollout_ref.rollout.tpu_slices and check that
+            # data_parallel_size x tensor_model_parallel_size replicas fit on the rollout slices.
+            from verl.plugin.platform.platform_tpu_slices import resolve_tpu_rollout_layout
+
+            resolve_tpu_rollout_layout(config)
         assert config.actor_rollout_ref.rollout.nnodes > 0, "nnodes must be > 0 in separate async training"
         assert config.actor_rollout_ref.rollout.n_gpus_per_node > 0, (
             "n_gpus_per_node must be > 0 in separate async training"
