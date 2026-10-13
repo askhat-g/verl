@@ -28,17 +28,16 @@ from torch.distributed.tensor import DTensor
 try:
     from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
     from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
-    from torchtitan.models.common.attention import VarlenAttention, segment_ids_from_positions
+    from torchtitan.models.common.attention import segment_ids_from_positions
 except ImportError:
     splash_sdpa = None
     apply_spmd_safe = None
-    VarlenAttention = None
     segment_ids_from_positions = None
 
 try:
-    import torchtitan.distributed.context_parallel as _tt_cp
+    import torchtitan.distributed.context_parallel as torchtitan_cp
 except ImportError:
-    _tt_cp = None
+    torchtitan_cp = None
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -59,10 +58,9 @@ def unwrap_metadata(val):
 
 
 def monkey_patch_varlen_attention_tpu():
-    """Patches TorchTitan's VarlenAttention forward method and CP wrapper for TPU execution."""
+    """Patches TorchTitan's VarlenAttention forward method to use native scaled_dot_product_attention on TPU."""
     try:
-        if VarlenAttention is None:
-            return
+        from torchtitan.models.common.attention import VarlenAttention
 
         def tpu_varlen_forward(
             self,
@@ -125,13 +123,6 @@ def monkey_patch_varlen_attention_tpu():
             return attn_out.transpose(1, 2)
 
         VarlenAttention.forward = tpu_varlen_forward
-        if _tt_cp is not None and hasattr(_tt_cp, "apply_cp_to_forward"):
-
-            def _tpu_apply_cp_to_forward(attention_modules, cp_mesh):
-                # TPUSplashAttention handles Ulysses CP directly inside its forward pass.
-                return
-
-            _tt_cp.apply_cp_to_forward = _tpu_apply_cp_to_forward
         logger.info("Successfully patched VarlenAttention.forward for TPU execution.")
     except Exception as e:
         logger.warning(f"Failed to patch VarlenAttention: {e}")
@@ -250,6 +241,31 @@ def gather_cp_1d(x: torch.Tensor, cp_group: torch.distributed.ProcessGroup | Non
     return _CPGather1D.apply(x, cp_group)
 
 
+def _resolve_splash_segment_ids(
+    segment_ids: torch.Tensor | None,
+    attention_masks: Any,
+    positions: torch.Tensor | None,
+    seq_len_full: int,
+    cp_group: torch.distributed.ProcessGroup | None,
+) -> torch.Tensor | None:
+    """Resolve full-sequence ``segment_ids`` for ``TPUSplashAttention``."""
+    if (
+        isinstance(attention_masks, torch.Tensor)
+        and attention_masks.dtype == torch.int32
+        and int(attention_masks.shape[-1]) == seq_len_full
+    ):
+        return attention_masks
+    if segment_ids is not None and int(segment_ids.shape[-1]) == seq_len_full:
+        return segment_ids
+    if positions is None or segment_ids_from_positions is None:
+        return segment_ids
+    if cp_group is not None:
+        positions = funcol.all_gather_tensor(positions.contiguous(), gather_dim=1, group=cp_group)
+        if isinstance(positions, funcol.AsyncCollectiveTensor):
+            positions = positions.wait()
+    return segment_ids_from_positions(positions)
+
+
 class TPUSplashAttention(torch.nn.Module):
     """TorchTitan inner attention backed by the TPU splash attention Pallas kernel.
 
@@ -284,8 +300,9 @@ class TPUSplashAttention(torch.nn.Module):
         segment_ids: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        cp_group = self.cp_mesh.get_group() if self.cp_mesh is not None and self.cp_mesh.size() > 1 else None
-        cp_size = int(self.cp_mesh.size()) if cp_group is not None else 1
+        has_cp = self.cp_mesh is not None and self.cp_mesh.size() > 1
+        cp_group = self.cp_mesh.get_group() if has_cp else None
+        cp_size = int(self.cp_mesh.size()) if has_cp else 1
         seq_len_full = int(q.shape[1]) * cp_size
 
         block = splash_block_size_for(seq_len_full)
@@ -311,25 +328,18 @@ class TPUSplashAttention(torch.nn.Module):
         positions = positions.to_local() if isinstance(positions, DTensor) else positions
         segment_ids = segment_ids.to_local() if isinstance(segment_ids, DTensor) else segment_ids
 
-        if cp_size > 1:
-            if (
-                isinstance(attention_masks, torch.Tensor)
-                and attention_masks.dtype == torch.int32
-                and int(attention_masks.shape[-1]) == seq_len_full
-            ):
-                segment_ids = attention_masks
-            elif segment_ids is None or int(segment_ids.shape[-1]) != seq_len_full:
-                if positions is not None and segment_ids_from_positions is not None:
-                    full_positions = funcol.all_gather_tensor(positions.contiguous(), gather_dim=1, group=cp_group)
-                    if isinstance(full_positions, funcol.AsyncCollectiveTensor):
-                        full_positions = full_positions.wait()
-                    segment_ids = segment_ids_from_positions(full_positions)
+        segment_ids = _resolve_splash_segment_ids(
+            segment_ids=segment_ids,
+            attention_masks=attention_masks,
+            positions=positions,
+            seq_len_full=seq_len_full,
+            cp_group=cp_group,
+        )
+        if has_cp:
             q_bnlh = _all_to_all_seq_to_head_bnlh(q, cp_group, cp_size)
             k_bnlh = _all_to_all_seq_to_head_bnlh(k, cp_group, cp_size)
             v_bnlh = _all_to_all_seq_to_head_bnlh(v, cp_group, cp_size)
         else:
-            if segment_ids is None and positions is not None and segment_ids_from_positions is not None:
-                segment_ids = segment_ids_from_positions(positions)
             q_bnlh = q.transpose(1, 2).contiguous()
             k_bnlh = k.transpose(1, 2).contiguous()
             v_bnlh = v.transpose(1, 2).contiguous()
@@ -351,7 +361,7 @@ class TPUSplashAttention(torch.nn.Module):
             block_kv_dkv=block,
             block_kv_dkv_compute=block,
         )
-        out = _all_to_all_head_to_seq_blnh(out_bnlh, cp_group, cp_size) if cp_size > 1 else out_bnlh.transpose(1, 2)
+        out = _all_to_all_head_to_seq_blnh(out_bnlh, cp_group, cp_size) if has_cp else out_bnlh.transpose(1, 2)
         if q_mesh is not None:
             out = DTensor.from_local(out, q_mesh, q_placements)
         return out
@@ -361,6 +371,9 @@ def make_spmd_safe_parallelize_fn(parallelize_fn):
     """Wrap a torchtitan ``parallelize_fn`` so each TransformerBlock is marked ``spmd_safe`` before compile."""
 
     def _parallelize(model: torch.nn.Module, *, compile_config, **kwargs) -> torch.nn.Module:
+        if torchtitan_cp is not None and hasattr(torchtitan_cp, "apply_cp_to_forward"):
+            # TPUSplashAttention handles Ulysses CP directly inside its forward pass.
+            torchtitan_cp.apply_cp_to_forward = lambda attention_modules, cp_mesh: None
         if apply_spmd_safe is not None and compile_config.enable and hasattr(model, "layers"):
             for block in model.layers.values():
                 apply_spmd_safe(block)
