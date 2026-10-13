@@ -156,7 +156,11 @@ class TorchTitanEngine(BaseEngine):
         # does not reject FlexAttention on backend='tpu').
         attn_backend = (
             "sdpa"
-            if (device_name == "tpu" and self.engine_config.use_splash_attention and self.engine_config.context_parallel_size > 1)
+            if (
+                device_name == "tpu"
+                and self.engine_config.use_splash_attention
+                and self.engine_config.context_parallel_size > 1
+            )
             else self.engine_config.attn_type
         )
         model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
@@ -498,7 +502,7 @@ class TorchTitanEngine(BaseEngine):
             same_micro_num_in_dp=True,
         )
         if is_tpu and (self._use_simple_fsdp or self.engine_config.context_parallel_size > 1):
-            # SimpleFSDP and Ulysses CP collectives run inside the compiled blocks: every rank must run the same program.
+            # SimpleFSDP and Ulysses CP collectives run inside compiled blocks: every rank must run the same program.
             align_micro_batch_shapes_across_ranks(
                 micro_batches,
                 cp_size=self.engine_config.context_parallel_size,

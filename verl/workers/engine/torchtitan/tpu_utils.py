@@ -126,6 +126,7 @@ def monkey_patch_varlen_attention_tpu():
 
         VarlenAttention.forward = tpu_varlen_forward
         if _tt_cp is not None and hasattr(_tt_cp, "apply_cp_to_forward"):
+
             def _tpu_apply_cp_to_forward(attention_modules, cp_mesh):
                 # TPUSplashAttention handles Ulysses CP directly inside its forward pass.
                 return
@@ -215,7 +216,7 @@ def _all_to_all_head_to_seq_blnh(
     cp_group: torch.distributed.ProcessGroup,
     cp_size: int,
 ) -> torch.Tensor:
-    """Redistribute ``(B, H_local, S_full, D)`` -> ``(B, S_full // cp_size, H_local * cp_size, D)`` via Ulysses all-to-all."""
+    """Redistribute ``(B, H_local, S_full, D)`` -> ``(B, S_full // cp_size, H_local * cp_size, D)`` via all-to-all."""
     bsz, heads_local, seq_full, head_dim = x.shape
     seq_local = seq_full // cp_size
     x_staged = x.view(bsz, heads_local, cp_size, seq_local, head_dim).permute(2, 0, 3, 1, 4).contiguous()
@@ -395,9 +396,7 @@ def apply_splash_attention_tpu(model_parts: list[torch.nn.Module], cp_mesh: Any 
             local_window_size = None
             if isinstance(window, tuple) and len(window) == 2 and window[0] >= 0:
                 local_window_size = int(window[0])
-            module.inner_attention = TPUSplashAttention(
-                inner, local_window_size=local_window_size, cp_mesh=cp_mesh
-            )
+            module.inner_attention = TPUSplashAttention(inner, local_window_size=local_window_size, cp_mesh=cp_mesh)
             replaced += 1
     if replaced == 0:
         raise ValueError("use_splash_attention=True but no module with an `inner_attention` was found")
@@ -770,4 +769,3 @@ def vocab_parallel_logprobs_from_logits(
         tp_rank = torch.distributed.get_rank(tp_group)
         local_logits = logits
     return _VocabParallelLogprobsFn.apply(local_logits, labels, temperature, tp_group, tp_rank)
-

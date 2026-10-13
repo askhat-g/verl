@@ -572,12 +572,9 @@ class TorchtitanEngineConfig(EngineConfig):
             f"tpu_eager_mode {self.tpu_eager_mode} not supported"
         )
         if self.use_simple_fsdp:
-            assert (
-                self.tensor_parallel_size
-                == self.pipeline_parallel_size
-                == self.expert_parallel_size
-                == 1
-            ), "use_simple_fsdp supports FSDP/HSDP (+ optional CP) only (tensor/pipeline/expert parallel size 1)"
+            assert self.tensor_parallel_size == self.pipeline_parallel_size == self.expert_parallel_size == 1, (
+                "use_simple_fsdp supports FSDP/HSDP (+ optional CP) only (tensor/pipeline/expert parallel size 1)"
+            )
         assert self.attn_type in ["flex", "flex_flash", "varlen"], (
             f"attn_type {self.attn_type} not supported (sdpa is not a valid language-model backend)"
         )
