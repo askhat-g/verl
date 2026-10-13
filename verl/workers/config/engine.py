@@ -575,10 +575,9 @@ class TorchtitanEngineConfig(EngineConfig):
             assert (
                 self.tensor_parallel_size
                 == self.pipeline_parallel_size
-                == self.context_parallel_size
                 == self.expert_parallel_size
                 == 1
-            ), "use_simple_fsdp supports pure FSDP/HSDP only (tensor/pipeline/context/expert parallel size 1)"
+            ), "use_simple_fsdp supports FSDP/HSDP (+ optional CP) only (tensor/pipeline/expert parallel size 1)"
         assert self.attn_type in ["flex", "flex_flash", "varlen"], (
             f"attn_type {self.attn_type} not supported (sdpa is not a valid language-model backend)"
         )

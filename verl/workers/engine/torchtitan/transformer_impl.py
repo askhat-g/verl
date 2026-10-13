@@ -59,6 +59,8 @@ from verl.workers.engine.torchtitan.tpu_utils import (
     bucket_length,
     compute_global_batch_num_tokens,
     configure_torch_compile_for_tpu,
+    gather_cp_1d,
+    make_spmd_safe_parallelize_fn,
     monkey_patch_varlen_attention_tpu,
     pad_packed_inputs_for_tpu,
     safe_to_padded_tensor,
@@ -149,14 +151,23 @@ class TorchTitanEngine(BaseEngine):
         # Derive torchtitan model name and flavor from HF config
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
 
-        # Get ModelSpec from model registry
+        # Get ModelSpec from model registry (use sdpa config when swapping in TPUSplashAttention with CP > 1
+        # so Qwen3Model.Config.update_from_config does not reject VarlenAttention.Config and apply_compile
+        # does not reject FlexAttention on backend='tpu').
+        attn_backend = (
+            "sdpa"
+            if (device_name == "tpu" and self.engine_config.use_splash_attention and self.engine_config.context_parallel_size > 1)
+            else self.engine_config.attn_type
+        )
         model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
-        model_spec = model_module.model_registry(torchtitan_flavor, attn_backend=self.engine_config.attn_type)
+        model_spec = model_module.model_registry(torchtitan_flavor, attn_backend=attn_backend)
         self._use_simple_fsdp = self.engine_config.use_simple_fsdp
         if self._use_simple_fsdp:
             model_spec.parallelize_fn = make_simple_fsdp_parallelize_fn(
                 model_spec.parallelize_fn, spmd_safe_blocks=device_name == "tpu"
             )
+        elif device_name == "tpu" and self.engine_config.context_parallel_size > 1:
+            model_spec.parallelize_fn = make_spmd_safe_parallelize_fn(model_spec.parallelize_fn)
 
         # Use foreach optimizer implementation on TPU.
         impl = "foreach" if get_platform().device_name == "tpu" else "fused"
@@ -274,8 +285,11 @@ class TorchTitanEngine(BaseEngine):
 
         self._use_splash_attention = device_name == "tpu" and self.engine_config.use_splash_attention
         if self._use_splash_attention:
-            apply_splash_attention_tpu(self.trainer.model_parts)
-        elif self.engine_config.use_splash_attention:
+            apply_splash_attention_tpu(
+                self.trainer.model_parts,
+                cp_mesh=self.parallel_dims.get_optional_mesh("cp"),
+            )
+        elif self.engine_config.use_splash_attention and device_name != "tpu":
             logger.warning("use_splash_attention is only supported on TPU; ignoring it on %s", device_name)
 
         if device_name == "tpu" and self.engine_config.use_torch_compile:
@@ -295,8 +309,11 @@ class TorchTitanEngine(BaseEngine):
         # but verl's loss function multiplies by dp_size to compensate for gradient averaging.
         # SimpleFSDP has no divide factor (its backward reduce-scatter sums), so forward_backward_batch
         # scales the loss by 1 / dp_size before backward instead.
-        self._simple_fsdp_loss_scale = 1.0 / self.get_data_parallel_size() if self._use_simple_fsdp else None
-        if self.engine_config.data_parallel_shard_size > 1 and not self._use_simple_fsdp:
+        use_loss_scale_for_dp = self._use_simple_fsdp or (
+            device_name == "tpu" and self.engine_config.context_parallel_size > 1
+        )
+        self._simple_fsdp_loss_scale = 1.0 / self.get_data_parallel_size() if use_loss_scale_for_dp else None
+        if self.engine_config.data_parallel_shard_size > 1 and not use_loss_scale_for_dp:
             dp_size = self.get_data_parallel_size()
             for model_part in self.trainer.model_parts:
                 enable_fsdp_gradient_division(model_part, dp_size)
@@ -444,25 +461,29 @@ class TorchTitanEngine(BaseEngine):
         raise NotImplementedError
 
     def get_context_parallel_group(self):
-        raise NotImplementedError
+        mesh = self.parallel_dims.get_optional_mesh("cp")
+        return mesh.get_group() if mesh is not None else None
 
     def _get_data_parallel_mesh(self):
-        """Get the data parallel mesh, handling hybrid/fully/replicate shard modes."""
-        mesh = self.parallel_dims.get_optional_mesh("loss")
-        if mesh is None:
-            mesh = self.parallel_dims.get_optional_mesh("fsdp")
-        if mesh is None:
-            mesh = self.parallel_dims.get_optional_mesh("dp_replicate")
-        return mesh
+        """Get the data parallel mesh (dp_replicate * dp_shard, excluding cp/tp/pp)."""
+        return self.parallel_dims.get_optional_mesh("batch")
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False):
         """Perform forward and optionally backward pass on a batch."""
-        tu.assign_non_tensor(data, sp_size=self.engine_config.tensor_parallel_size)
+        tu.assign_non_tensor(
+            data,
+            sp_size=self.engine_config.tensor_parallel_size * self.engine_config.context_parallel_size,
+        )
         dp_group = self.get_data_parallel_group()
         is_tpu = get_device_name() == "tpu"
 
         if is_tpu:
-            batch_num_tokens = compute_global_batch_num_tokens(data, dp_group, self.engine_config.tensor_parallel_size)
+            batch_num_tokens = compute_global_batch_num_tokens(
+                data,
+                dp_group,
+                self.engine_config.tensor_parallel_size,
+                self.engine_config.context_parallel_size,
+            )
         else:
             batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
             if dp_group is not None:
@@ -476,9 +497,12 @@ class TorchTitanEngine(BaseEngine):
             dp_group=self.get_data_parallel_group(),
             same_micro_num_in_dp=True,
         )
-        if is_tpu and self._use_simple_fsdp:
-            # SimpleFSDP's collectives run inside the compiled blocks: every rank must run the same program.
-            align_micro_batch_shapes_across_ranks(micro_batches)
+        if is_tpu and (self._use_simple_fsdp or self.engine_config.context_parallel_size > 1):
+            # SimpleFSDP and Ulysses CP collectives run inside the compiled blocks: every rank must run the same program.
+            align_micro_batch_shapes_across_ranks(
+                micro_batches,
+                cp_size=self.engine_config.context_parallel_size,
+            )
 
         output_lst = []
 
@@ -874,12 +898,17 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
         if use_remove_padding:
             if get_device_name() == "tpu":
+                cp_mesh = self.parallel_dims.get_optional_mesh("cp")
+                cp_size = cp_mesh.size() if cp_mesh is not None else 1
+                cp_rank = cp_mesh.get_local_rank() if cp_mesh is not None else 0
                 input_ids, position_ids, labels, attention_mask, orig_seq_len = pad_packed_inputs_for_tpu(
                     input_ids=input_ids,
                     position_ids=position_ids,
                     micro_batch=micro_batch,
                     device=get_device_id(),
                     build_attention_mask=not self._use_splash_attention,
+                    cp_size=cp_size,
+                    cp_rank=cp_rank,
                 )
                 output_args["orig_seq_len"] = orig_seq_len
             else:
@@ -926,7 +955,8 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         # dict as extra_inputs are not forwarded to other stages in PP, but
         # extra_kwargs are.
         extra_kwargs: dict[str, Any] = {"attention_masks": attention_mask}
-        if self.parallel_dims.cp_enabled:
+        if self.parallel_dims.cp_enabled and not (use_remove_padding and get_device_name() == "tpu"):
+            extra_kwargs["positions"] = position_ids
             input_ids, labels, extra_kwargs = prepare_context_parallel_input(
                 input_ids,
                 labels,
@@ -935,6 +965,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 self.trainer.device,
                 self.trainer.config.parallelism.context_parallel_load_balancer,
             )
+            extra_inputs["positions"] = extra_kwargs.pop("positions")
 
         # TODO(jessicazhong): multimodal is not yet supported for Torchtitan engine
         extra_inputs.update(multi_modal_inputs)
@@ -1011,6 +1042,11 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     entropy_rmpad = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
 
             padded_log_probs = log_probs.squeeze(0)
+            if self.parallel_dims.cp_enabled:
+                cp_group = self.get_context_parallel_group()
+                padded_log_probs = gather_cp_1d(padded_log_probs, cp_group)
+                if calculate_entropy:
+                    entropy_rmpad = gather_cp_1d(entropy_rmpad, cp_group)
             orig_seq_len = output_args.get("orig_seq_len")
             if orig_seq_len is not None:
                 cu_seqlens_cpu = cu_seqlens.detach().cpu()
