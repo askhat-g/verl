@@ -56,8 +56,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         train_batch_size = config.data.train_batch_size
         ppo_mini_batch_size = config.actor_rollout_ref.actor.ppo_mini_batch_size
         parameter_sync_step = config.trainer.v1.separate_async.parameter_sync_step
-        assert train_batch_size == parameter_sync_step * ppo_mini_batch_size, (
-            f"train_batch_size must equal parameter_sync_step * ppo_mini_batch_size in separate async "
+        assert train_batch_size % (parameter_sync_step * ppo_mini_batch_size) == 0, (
+            f"train_batch_size must be divisible by parameter_sync_step * ppo_mini_batch_size in separate async "
             f"training, but got train_batch_size={train_batch_size}, "
             f"parameter_sync_step={parameter_sync_step}, ppo_mini_batch_size={ppo_mini_batch_size}"
         )

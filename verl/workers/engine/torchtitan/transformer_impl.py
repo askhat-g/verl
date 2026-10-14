@@ -16,14 +16,17 @@ The concrete Engine implementation using PyTorch TorchTitan parallelism (FSDP2 +
 """
 
 import importlib
+import json
 import logging
 import os
 import re
+import shutil
 from contextlib import nullcontext
 from typing import Any, Callable, Optional
 
 import torch
 import torch.distributed
+from safetensors.torch import save_file as save_safetensors_file
 from tensordict import TensorDict
 from torch.distributed.tensor import DTensor
 from torchtitan.components.checkpoint import CheckpointManager
@@ -642,19 +645,101 @@ class TorchTitanEngine(BaseEngine):
             for module in self.module:
                 load_fsdp_model_to_gpu(module)
 
-        # Override TorchTitan's folder to use verl's path
-        parent_dir = os.path.dirname(local_path)
-        self.checkpointer.folder = parent_dir
+        save_contents = (
+            list(self.checkpoint_config.save_contents)
+            if self.checkpoint_config is not None and self.checkpoint_config.save_contents is not None
+            else ["model", "optimizer", "extra"]
+        )
 
-        if max_ckpt_to_keep is not None:
-            self.checkpointer.keep_latest_k = max_ckpt_to_keep
+        if any(k in save_contents for k in ("model", "optimizer")):
+            # Override TorchTitan's folder to use verl's path
+            parent_dir = os.path.dirname(local_path)
+            self.checkpointer.folder = parent_dir
 
-        self.checkpointer.save(curr_step=global_step)
+            if max_ckpt_to_keep is not None:
+                self.checkpointer.keep_latest_k = max_ckpt_to_keep
+
+            self.checkpointer.save(curr_step=global_step)
+
+        if "hf_model" in save_contents:
+            self._save_hf_checkpoint(local_path)
 
         torch.distributed.barrier()
         if self._is_offload_param:
             for module in self.module:
                 offload_fsdp_model_to_cpu(module)
+
+    def _save_hf_checkpoint(self, local_path: str) -> None:
+        """Export full HuggingFace safetensors + config/tokenizer into ``<local_path>/huggingface``."""
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        should_write = rank == 0 or (local_rank == 0 and local_path.startswith(("/dev/shm", "/tmp")))
+        param_gen, _ = self.get_per_tensor_param()
+        cpu_state_dict: dict[str, torch.Tensor] = {}
+        for name, tensor in param_gen:
+            if should_write:
+                cpu_state_dict[name] = tensor.detach().cpu().contiguous()
+            elif get_device_name() == "tpu":
+                get_platform().synchronize()
+            del tensor
+
+        if should_write:
+            hf_config = getattr(self.model_config, "hf_config", None)
+            if getattr(hf_config, "tie_word_embeddings", False) and "model.embed_tokens.weight" in cpu_state_dict:
+                cpu_state_dict.pop("lm_head.weight", None)
+
+            hf_local_path = os.path.join(local_path, "huggingface")
+            os.makedirs(hf_local_path, exist_ok=True)
+
+            src_dir = getattr(self.model_config, "path", None)
+            if src_dir and os.path.isdir(src_dir):
+                for fname in os.listdir(src_dir):
+                    src_file = os.path.join(src_dir, fname)
+                    if not os.path.isfile(src_file):
+                        continue
+                    if fname.endswith((".safetensors", ".bin", ".pt", ".pth", ".ckpt")) or fname in (
+                        "model.safetensors.index.json",
+                        "pytorch_model.bin.index.json",
+                    ):
+                        continue
+                    shutil.copy2(src_file, os.path.join(hf_local_path, fname))
+
+            if hf_config is not None and not os.path.isfile(os.path.join(hf_local_path, "config.json")):
+                hf_config.save_pretrained(hf_local_path)
+            tokenizer = getattr(self.model_config, "tokenizer", None)
+            if tokenizer is not None and not os.path.isfile(os.path.join(hf_local_path, "tokenizer_config.json")):
+                tokenizer.save_pretrained(hf_local_path)
+
+            index_file = os.path.join(src_dir, "model.safetensors.index.json") if src_dir else ""
+            if index_file and os.path.isfile(index_file):
+                with open(index_file, encoding="utf-8") as f:
+                    index_data = json.load(f)
+                weight_map = index_data.get("weight_map", {})
+                default_shard = next(iter(weight_map.values()), "model.safetensors")
+                shards: dict[str, dict[str, torch.Tensor]] = {}
+                new_weight_map: dict[str, str] = {}
+                for k, v in cpu_state_dict.items():
+                    shard_name = weight_map.get(k, default_shard)
+                    shards.setdefault(shard_name, {})[k] = v
+                    new_weight_map[k] = shard_name
+                for shard_name, shard_tensors in shards.items():
+                    save_safetensors_file(
+                        shard_tensors,
+                        os.path.join(hf_local_path, shard_name),
+                        metadata={"format": "pt"},
+                    )
+                index_data["weight_map"] = new_weight_map
+                with open(os.path.join(hf_local_path, "model.safetensors.index.json"), "w", encoding="utf-8") as f:
+                    json.dump(index_data, f, indent=2)
+            else:
+                save_safetensors_file(
+                    cpu_state_dict,
+                    os.path.join(hf_local_path, "model.safetensors"),
+                    metadata={"format": "pt"},
+                )
+
+            logger.info("Saved HuggingFace checkpoint to %s", hf_local_path)
+            del cpu_state_dict
 
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs

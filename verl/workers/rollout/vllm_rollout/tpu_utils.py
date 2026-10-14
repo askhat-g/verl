@@ -348,9 +348,18 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         kv_head_idx = get_tensor_model_parallel_rank() // (tp_size // num_kv_heads) if num_kv_heads < tp_size else None
 
         staging_tensors = {}
+        shape_pool = {}
+        param_idx_map = {}
+        param_shape_map = {}
         variable_protos = []
         valid_params = []
         replicas = {}
+
+        def _role_tag(param_name: str) -> str:
+            for tag in (".q_proj.", ".k_proj.", ".v_proj.", ".gate_proj.", ".up_proj."):
+                if tag in param_name:
+                    return tag
+            return "other"
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
@@ -381,9 +390,15 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             # tp_size for unsharded tensors (norms). The norm parity check divides by it when summing over ranks.
             replicas[name] = tp_size // int(np.prod(sharding_mesh))
 
-            # Allocate local TPU staging buffer with matching layout
-            t = torch.empty(local_shape, dtype=torch.bfloat16, device=torch.device("tpu"))
+            # Pool local TPU staging buffers by (role_tag, local_shape) so all transformer layers share
+            # a single set of scratch buffers on TPU HBM (~0.59 GiB instead of ~15.26 GiB at TP=4).
+            pool_key = (_role_tag(name), tuple(local_shape))
+            if pool_key not in shape_pool:
+                shape_pool[pool_key] = torch.empty(local_shape, dtype=torch.bfloat16, device=torch.device("tpu"))
+            t = shape_pool[pool_key]
             staging_tensors[name] = t
+            param_idx_map[name] = idx
+            param_shape_map[name] = tuple(local_shape)
             valid_params.append((name, t))
 
             variable_protos.append(
@@ -400,6 +415,8 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             )
 
         self._raiden_staging = staging_tensors
+        self._raiden_param_idx = param_idx_map
+        self._raiden_param_shape = param_shape_map
         self._sorted_vllm_params = valid_params
         self._raiden_replicas = replicas
 
@@ -477,9 +494,26 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             return {}
 
         t_start = time.perf_counter()
-        t_h2d_start = time.perf_counter()
-        self._raiden_ws.h2d()
-        t_h2d = time.perf_counter() - t_h2d_start
+        param_idx_map = getattr(self, "_raiden_param_idx", None)
+        param_shape_map = getattr(self, "_raiden_param_shape", None)
+        t_h2d = 0.0
+        if not param_idx_map:
+            t_h2d_start = time.perf_counter()
+            self._raiden_ws.h2d()
+            t_h2d = time.perf_counter() - t_h2d_start
+
+        def _load_staging_tensor(param_name: str) -> torch.Tensor:
+            nonlocal t_h2d
+            t_buf = self._raiden_staging[param_name]
+            if param_idx_map is not None and param_name in param_idx_map:
+                t0 = time.perf_counter()
+                idx = param_idx_map[param_name]
+                shape = param_shape_map[param_name]
+                numel = int(np.prod(shape))
+                host_view = self._raiden_ws.get_host_buffer(idx, 0).view(torch.bfloat16)[:numel].view(shape)
+                t_buf.copy_(host_view)
+                t_h2d += time.perf_counter() - t0
+            return t_buf
 
         # Unpack, fuse, and transpose staging tensors into vLLM model parameters
         vllm_model = self._get_vllm_model()
@@ -548,7 +582,7 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
                             )
                             parent_mod = get_parent_mod(resolved_key)
                             is_flipped = bool(getattr(parent_mod, "_tpu_weight_flipped", False))
-                            parts = [self._raiden_staging[sk] for sk in layer_src_keys]
+                            parts = [_load_staging_tensor(sk) for sk in layer_src_keys]
                             fused = torch.cat(parts, dim=0)
                             fused_adapted = to_target_layout(fused, target_local, is_flipped)
                             if parity:
@@ -558,11 +592,12 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         # 2. Handle all remaining non-fused parameters (o_proj, down_proj, layernorms, embeddings)
         unresolved = []
-        for name, src_t in self._raiden_staging.items():
+        for name in self._raiden_staging:
             if name in consumed_staging:
                 continue
             resolved_key = resolve_model_key(name)
             if resolved_key is not None:
+                src_t = _load_staging_tensor(name)
                 target_param = model_sd[resolved_key]
                 target_local = target_param.to_local() if hasattr(target_param, "to_local") else target_param
                 parent_mod = get_parent_mod(resolved_key)
@@ -633,7 +668,19 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         from verl.checkpoint_engine.raiden_checkpoint_engine import compute_tensor_stats
 
-        res = compute_tensor_stats(self._sorted_vllm_params)
+        param_idx_map = getattr(self, "_raiden_param_idx", None)
+        param_shape_map = getattr(self, "_raiden_param_shape", None)
+        if param_idx_map:
+            items = []
+            for name, _ in self._sorted_vllm_params:
+                idx = param_idx_map[name]
+                shape = param_shape_map[name]
+                numel = int(np.prod(shape))
+                host_view = self._raiden_ws.get_host_buffer(idx, 0).view(torch.bfloat16)[:numel].view(shape)
+                items.append((name, host_view))
+            res = compute_tensor_stats(items)
+        else:
+            res = compute_tensor_stats(self._sorted_vllm_params)
         res["rank"] = rank_val
         replicas = getattr(self, "_raiden_replicas", {})
         for name, stats in res["per_tensor"].items():

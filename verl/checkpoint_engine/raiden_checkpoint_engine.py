@@ -988,9 +988,12 @@ async def update_raiden_weights(
         )
 
     barrier_timeout = 60.0
+    num_vars = 0
     while True:
         with manager.raiden_controller._lock:
             registered = set(manager.raiden_controller._registered_shards.keys())
+            if src_units and src_units[0] in manager.raiden_controller._registered_variables:
+                num_vars = len(manager.raiden_controller._registered_variables[src_units[0]] or [])
         src_registered = all(u in registered for u in src_units)
         dst_registered = all(u in registered for u in dst_units)
         if src_registered and dst_registered:
@@ -1012,6 +1015,7 @@ async def update_raiden_weights(
     # 4. Trigger the coordinated P2P transfer via the central RaidenController: one transfer whose destination
     #    holds the units of every rollout replica (see the note above dst_units).
     t_transfer_start = time.perf_counter()
+    skip_tiling = {i: False for i in range(num_vars)} if num_vars > 0 else None
     transfer_future = manager.raiden_controller.start_transfer(
         src_units=src_units,
         dst_units=dst_units,
@@ -1021,6 +1025,7 @@ async def update_raiden_weights(
         expected_block_count=0,
         parallelism=parallelism,
         req_id=f"verl_step_{global_steps or 0}",
+        skip_tiling=skip_tiling,
     )
     await transfer_future.wait()
     t_transfer = time.perf_counter() - t_transfer_start
