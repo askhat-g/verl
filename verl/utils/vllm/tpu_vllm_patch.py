@@ -17,6 +17,7 @@ import importlib.util
 import inspect
 import logging
 import os
+import sys
 
 import torch
 
@@ -76,6 +77,9 @@ def patch_tpu_rotary_emb():
             is_neox_style: bool = True,
             enable_fp32_compute: bool = False,
         ) -> torch.Tensor:
+            # Match CUDA: compute the rotation in FP32, then round once to the input dtype.
+            if x.device.type == "tpu" and x.dtype in (torch.bfloat16, torch.float16):
+                enable_fp32_compute = True
             origin_dtype = x.dtype
             if enable_fp32_compute:
                 x = x.float()
@@ -217,6 +221,140 @@ def patch_tpu_sampler() -> None:
     logger.info("Applied TPU generator FP32 sampling-noise patch.")
 
 
+ATTN_FP32_STATS_ENV = "VERL_TPU_VLLM_ATTN_FP32_STATS"
+_RPA_KERNEL_MODULE = "vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel"
+_RPA_ALIAS_MODULES = ("vllm_torchtpu.layers.core.attention_interface", "vllm_torchtpu.layers.adapter.attention")
+
+
+def patch_tpu_attention_fp32_stats() -> bool:
+    """Opt-in (``VERL_TPU_VLLM_ATTN_FP32_STATS=1``): fp32 softmax statistics in the ragged-paged-attention kernel.
+
+    vllm-torchtpu calls the v3 Pallas kernel with ``out_dtype=None``; on bf16 queries that keeps the running
+    max/sum, the exp() probabilities and the cross-KV-block accumulator in bf16, where CUDA FlashAttention keeps
+    them fp32. Measured on Qwen3-4B-Base (2026-10-09 capture), vLLM-TPU then carries ~1.25x the per-token
+    log-prob error of the TPU trainer and of vLLM-CUDA against an fp32 reference. With the flag the kernel runs
+    with ``out_dtype=float32`` and its output is cast back to the query dtype, so only the attention-internal
+    rounding changes. Returns True when the patch is installed.
+    """
+    if os.environ.get(ATTN_FP32_STATS_ENV) != "1":
+        return False
+    try:
+        import jax.numpy as jnp
+
+        kernel = importlib.import_module(_RPA_KERNEL_MODULE)
+    except ImportError as exc:
+        logger.debug("Skipping the fp32 attention statistics patch (jax / vllm_torchtpu not installed): %s", exc)
+        return False
+    original = kernel.ragged_paged_attention
+    if getattr(original, "_verl_fp32_stats", False):
+        return True
+
+    def ragged_paged_attention(*args, **kwargs):
+        # The kernel lays out its output buffer in the query dtype, so fp32 statistics need fp32 queries
+        # (bf16 queries pack two values per word and the fp32 result no longer fits that layout). Keys,
+        # values and the KV cache stay bf16; QK^T/softmax/PV accumulate in fp32; the output returns to bf16.
+        if args:
+            queries, args = args[0], args[1:]
+        else:
+            queries = kwargs.pop("queries")
+        query_dtype = queries.dtype
+        kwargs["out_dtype"] = jnp.float32
+        result = original(queries.astype(jnp.float32), *args, **kwargs)
+        if isinstance(result, tuple):
+            return (result[0].astype(query_dtype), *result[1:])
+        return result.astype(query_dtype)
+
+    # No functools.wraps: the kernel is a jax.jit object whose bookkeeping attributes must not be copied.
+    setattr(ragged_paged_attention, "_verl_fp32_stats", True)  # noqa: B010 - marker on a plain function
+    setattr(ragged_paged_attention, "_verl_original", original)  # noqa: B010
+    setattr(kernel, "ragged_paged_attention", ragged_paged_attention)  # noqa: B010
+    # attention_interface/adapter bind the kernel to a module-level name at import; rebind those aliases too.
+    for name in _RPA_ALIAS_MODULES:
+        module = sys.modules.get(name)
+        if module is None:
+            try:
+                module = importlib.import_module(name)
+            except ImportError:
+                continue
+        if getattr(module, "ragged_paged_attention", None) is original:
+            setattr(module, "ragged_paged_attention", ragged_paged_attention)  # noqa: B010
+    logger.warning("vLLM-TPU ragged paged attention: fp32 softmax statistics enabled (%s=1)", ATTN_FP32_STATS_ENV)
+    return True
+
+
+def _fp32_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    """Keep CUDA's BF16/FP16 activation rounding before the gated product."""
+    d = x.shape[-1] // 2
+    activated = torch.nn.functional.silu(x[..., :d].float()).to(x.dtype)
+    return activated * x[..., d:]
+
+
+def patch_tpu_silu_and_mul() -> None:
+    """Patch the native path before vLLM constructs TPU SwiGLU layers."""
+    if importlib.util.find_spec("vllm_torchtpu") is None:
+        return
+
+    from vllm.model_executor.layers.activation import SiluAndMul
+
+    if getattr(SiluAndMul, "_verl_fp32_silu_and_mul_patched", False):
+        return
+    original = SiluAndMul.forward_native
+
+    def forward_native(x: torch.Tensor) -> torch.Tensor:
+        if x.device.type != "tpu" or x.dtype not in (torch.bfloat16, torch.float16):
+            return original(x)
+        return _fp32_silu_and_mul(x)
+
+    # Disabled CustomOps also call forward_native; patching only forward_tpu misses them.
+    SiluAndMul.forward_native = staticmethod(forward_native)
+    SiluAndMul._verl_fp32_silu_and_mul_patched = True
+    logger.info("Applied TPU generator FP32 SiLU computation with CUDA activation rounding.")
+
+
+RMSNORM_CUDA_ORDER_ENV = "VERL_TPU_VLLM_RMSNORM_CUDA_ORDER"
+
+
+def _cuda_order_rms_norm(self, x: torch.Tensor, residual: torch.Tensor | None = None):
+    """Match CUDA: round the residual sum first, and round after the affine multiply."""
+    dtype = x.dtype
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        value = x.float()
+        if residual is not None:
+            residual = (value + residual.float()).to(dtype)
+            value = residual.float()
+        size = self.variance_size_override
+        variance_input = value if size is None else value[..., :size]
+        variance = variance_input.square().mean(dim=-1, keepdim=True)
+        value = value * torch.rsqrt(variance + self.variance_epsilon)
+        has_weight = self.pass_weight if residual is None else self.pass_weight_add
+        if has_weight:
+            value = value * self.weight.data.float()
+        output = value.to(dtype)
+    return output if residual is None else (output, residual)
+
+
+def patch_tpu_rms_norm() -> None:
+    """Opt in before TPU RMSNorm layers bind their native forward."""
+    if os.environ.get(RMSNORM_CUDA_ORDER_ENV) != "1":
+        return
+    try:
+        from vllm.model_executor.layers.layernorm import RMSNorm
+    except ImportError:
+        return
+    if getattr(RMSNorm, "_verl_cuda_order_rms_norm_patched", False):
+        return
+    original = RMSNorm.forward_native
+
+    def forward_native(self, x: torch.Tensor, residual: torch.Tensor | None = None):
+        if x.device.type != "tpu" or x.dtype not in (torch.bfloat16, torch.float16):
+            return original(self, x, residual)
+        return _cuda_order_rms_norm(self, x, residual)
+
+    RMSNorm.forward_native = forward_native
+    RMSNorm._verl_cuda_order_rms_norm_patched = True
+    logger.warning("Enabled TPU vLLM RMSNorm CUDA rounding (%s=1)", RMSNORM_CUDA_ORDER_ENV)
+
+
 def _tpu_runtime_present() -> bool:
     """True when this process runs against the TPU backend.
 
@@ -251,3 +389,6 @@ def apply_tpu_vllm_patches() -> None:
     patch_tpu_rotary_emb()
     patch_tpu_logprobs()
     patch_tpu_sampler()
+    patch_tpu_silu_and_mul()
+    patch_tpu_rms_norm()
+    patch_tpu_attention_fp32_stats()

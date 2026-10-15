@@ -15,15 +15,18 @@
 
 import logging
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from types import MethodType
 from typing import Any
 
 import torch
 import torch.distributed
+import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict
 from torch.distributed import _functional_collectives as funcol
 from torch.distributed.tensor import DTensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 try:
     from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
@@ -55,6 +58,152 @@ def unwrap_metadata(val):
         elif val.numel() > 1:
             return val.flatten()[0].item()
     return val
+
+
+class _TPURMSNormAffine(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, normalized: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(normalized, weight)
+        return normalized * weight.float()
+
+    @staticmethod
+    def backward(ctx, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        normalized, weight = ctx.saved_tensors
+        gradient = gradient.float()
+        grad_normalized = gradient * weight.float()
+        product = gradient * normalized
+        dimensions = tuple(range(product.ndim - weight.ndim))
+        grad_weight = product.sum(dim=dimensions, dtype=torch.float32) if dimensions else product
+        # Let autograd cast at the parameter edge. An explicit BF16 return cast
+        # permits XLA to push that rounding inside the reduction, even with
+        # bfloat16-propagation disabled by the trainer compiler context.
+        return grad_normalized, grad_weight
+
+
+def _tpu_fp32_rms_norm(self: nn.RMSNorm, x: torch.Tensor) -> torch.Tensor:
+    # Match CUDA autocast before Q/K RoPE and the final LM head. Casting an
+    # already-rounded BF16 norm output to FP32 cannot recover the lost precision.
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        weight = self.weight
+        if weight is not None and weight.dtype == torch.bfloat16:
+            normalized = F.rms_norm(x.float(), self.normalized_shape, None, self.eps)
+            return _TPURMSNormAffine.apply(normalized, weight)
+        weight = weight.float() if weight is not None else None
+        return F.rms_norm(x.float(), self.normalized_shape, weight, self.eps)
+
+
+def _patch_rms_norm(module: nn.Module) -> None:
+    # The traversal includes Q/K norms, both block norms, and the final decoder norm.
+    if isinstance(module, nn.RMSNorm) and getattr(module.forward, "__func__", None) is not _tpu_fp32_rms_norm:
+        module.forward = MethodType(_tpu_fp32_rms_norm, module)
+
+
+def _tpu_fp32_feed_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    # CUDA's BF16 SiLU uses FP32 arithmetic before rounding the activation.
+    # Explicitly retain that arithmetic on TPU, including its backward path.
+    gate = self.w1(x)
+    activated = F.silu(gate.float()).to(gate.dtype)
+    return self.w2(activated * self.w3(x))
+
+
+def _patch_feed_forward(module: nn.Module) -> None:
+    module_type = type(module)
+    if (
+        module_type.__name__ == "SimpleFSDPFeedForward"
+        and hasattr(module, "_simple_fsdp_parametrization_list")
+        and len(module_type.__bases__) == 1
+    ):
+        module_type = module_type.__bases__[0]
+    if module_type.__module__ != "torchtitan.models.common.feed_forward":
+        return
+    from torchtitan.models.common.feed_forward import FeedForward
+
+    if module_type is FeedForward and getattr(module.forward, "__func__", None) is not _tpu_fp32_feed_forward:
+        module.forward = MethodType(_tpu_fp32_feed_forward, module)
+
+
+def apply_tpu_precision_patches(model_parts: list[torch.nn.Module]) -> None:
+    """Apply the TPU FP32 RMSNorm and SiLU corrections before the first forward."""
+    # torch_tpu defaults FP32 dots to reduced precision; match the CUDA golden run.
+    torch.set_float32_matmul_precision("highest")
+    for model in model_parts:
+        for module in model.modules():
+            _patch_rms_norm(module)
+            _patch_feed_forward(module)
+
+
+class _TPUFp32LogitsLinear(torch.autograd.Function):
+    """Preserve FP32 projection accumulators with BF16 operands and backward matmuls."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        x_b = x.to(torch.bfloat16)
+        w_b = weight.to(torch.bfloat16)
+        ctx.save_for_backward(x_b, w_b)
+        ctx.x_dtype, ctx.w_dtype = x.dtype, weight.dtype
+        previous = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("medium")
+        try:
+            return torch.matmul(x_b.float(), w_b.float().t())
+        finally:
+            torch.set_float32_matmul_precision(previous)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x_b, w_b = ctx.saved_tensors
+        g = grad.to(torch.bfloat16)
+        grad_x = torch.matmul(g, w_b).to(ctx.x_dtype)
+        grad_w = torch.matmul(g.reshape(-1, g.shape[-1]).t(), x_b.reshape(-1, x_b.shape[-1])).to(ctx.w_dtype)
+        return grad_x, grad_w
+
+
+def _tpu_fp32_logits_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    if getattr(self, "bias", None) is not None:
+        raise ValueError("fp32_logits supports a bias-free LM head only")
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+        return _TPUFp32LogitsLinear.apply(x, weight)
+
+
+def apply_fp32_logits_tpu(modules: Any) -> int:
+    """Patch each LM head before its first forward; leave its parameter storage unchanged."""
+    if modules is None:
+        return 0
+    model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
+    patched = 0
+    for model in model_list:
+        head = getattr(model, "lm_head", None)
+        if not isinstance(head, torch.nn.Module):
+            continue
+        if getattr(head.forward, "__func__", None) is _tpu_fp32_logits_forward:
+            continue
+        head.forward = MethodType(_tpu_fp32_logits_forward, head)
+        patched += 1
+    if patched:
+        logger.warning("fp32 logits enabled on TPU: patched %d lm_head module(s)", patched)
+    return patched
+
+
+_attention_dtype_fallback_logged = False
+
+
+def attention_compute_dtype(x: torch.Tensor) -> torch.dtype | None:
+    """Use the autocast dtype at the attention kernel boundary, preserving FP32 otherwise."""
+    global _attention_dtype_fallback_logged
+    device_type = x.device.type
+    try:
+        if torch.is_autocast_enabled(device_type):
+            return torch.get_autocast_dtype(device_type)
+        return None
+    except (RuntimeError, TypeError, ValueError) as e:
+        if not _attention_dtype_fallback_logged:
+            _attention_dtype_fallback_logged = True
+            logger.warning(
+                "Could not query autocast state for device %r (%s); TPU attention will run in bfloat16.",
+                device_type,
+                e,
+            )
+        return torch.bfloat16
 
 
 def monkey_patch_varlen_attention_tpu():
@@ -111,6 +260,11 @@ def monkey_patch_varlen_attention_tpu():
             k = xk.transpose(1, 2)
             v = xv.transpose(1, 2)
 
+            # Match CUDA's attention boundary after FP32 Q/K norm and RoPE.
+            compute_dtype = attention_compute_dtype(xq)
+            if compute_dtype is not None:
+                q, k, v = q.to(compute_dtype), k.to(compute_dtype), v.to(compute_dtype)
+
             if q.shape[1] != k.shape[1]:
                 num_repeat = q.shape[1] // k.shape[1]
                 k = k.repeat_interleave(num_repeat, dim=1)
@@ -119,8 +273,12 @@ def monkey_patch_varlen_attention_tpu():
             # Eager only: TorchTitanEngine rejects use_torch_compile without use_splash_attention on TPU,
             # because F.scaled_dot_product_attention traced by torch.compile(backend="tpu") yields NaN q/k/v
             # gradients. With splash attention enabled this module is replaced by TPUSplashAttention.
-            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
-            return attn_out.transpose(1, 2)
+            if q.dtype == torch.float32:
+                with sdpa_kernel([SDPBackend.MATH]):
+                    attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+            else:
+                attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+            return attn_out.transpose(1, 2).to(q_BLNH.dtype)
 
         VarlenAttention.forward = tpu_varlen_forward
         logger.info("Successfully patched VarlenAttention.forward for TPU execution.")
@@ -344,10 +502,12 @@ class TPUSplashAttention(torch.nn.Module):
             k_bnlh = k.transpose(1, 2).contiguous()
             v_bnlh = v.transpose(1, 2).contiguous()
 
+        # Splash requires BF16 inputs after FP32 Q/K norm and RoPE.
+        input_dtype = q.dtype
         out_bnlh = splash_sdpa(
-            q_bnlh,
-            k_bnlh,
-            v_bnlh,
+            q_bnlh.to(torch.bfloat16).contiguous(),
+            k_bnlh.to(torch.bfloat16).contiguous(),
+            v_bnlh.to(torch.bfloat16).contiguous(),
             segment_ids=segment_ids,
             scale=scale,
             is_causal=True,
@@ -362,6 +522,7 @@ class TPUSplashAttention(torch.nn.Module):
             block_kv_dkv_compute=block,
         )
         out = _all_to_all_head_to_seq_blnh(out_bnlh, cp_group, cp_size) if has_cp else out_bnlh.transpose(1, 2)
+        out = out.to(input_dtype)
         if q_mesh is not None:
             out = DTensor.from_local(out, q_mesh, q_placements)
         return out
@@ -474,8 +635,9 @@ def synchronize_tpu_loss(loss: torch.Tensor):
         pass
 
 
+@contextmanager
 def tpu_eager_mode_context(mode: str | None):
-    """Context manager running the enclosed ops under the torch_tpu eager ``mode`` (no-op for None).
+    """Run trainer operations with the requested eager mode and FP32 reduction precision.
 
     Mirrors torchtitan's ``tpu_config.eager_mode`` (``torchtitan/experiments/tpu/gmain.py``), which the
     afmv7 / qwen3 TPU recipes set to ``DEFER_AND_FUSE``: ops outside the compiled blocks are deferred
@@ -483,11 +645,24 @@ def tpu_eager_mode_context(mode: str | None):
     one XLA program per op (the torch_tpu default, ``DEFER_NEVER``). A context manager rather than a
     global setting so it applies to whichever Ray actor thread runs the RPC.
     """
-    if mode is None:
-        return nullcontext()
-    from torch_tpu._internal import execution_mode
+    try:
+        from torch_tpu._internal import execution_mode
+    except ImportError:
+        yield
+        return
 
-    return execution_mode.set_eager_mode(getattr(execution_mode.EagerMode, mode))
+    try:
+        from torch_tpu._internal.compiler_options import custom_compiler_options
+    except ImportError as error:
+        raise RuntimeError("TPU trainer precision requires TorchTPU's custom_compiler_options API") from error
+
+    eager_context = (
+        execution_mode.set_eager_mode(getattr(execution_mode.EagerMode, mode)) if mode is not None else nullcontext()
+    )
+    # Keep XLA from rounding RMSNorm weight-gradient products before their FP32 reduction.
+    # This trainer-local override leaves the separate JAX/vLLM generator unchanged.
+    with eager_context, custom_compiler_options({"xla_disable_hlo_passes": "bfloat16-propagation"}):
+        yield
 
 
 def get_tpu_seq_bucket_size() -> int:

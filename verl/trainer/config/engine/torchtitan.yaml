@@ -25,6 +25,12 @@ use_orig_params: false
 # Mixed precision configuration for FSDP
 mixed_precision: false
 
+# Override TorchTitan's mixed precision parameter dtype (null preserves its default).
+mixed_precision_param: null
+
+# TPU only: preserve FP32 LM-head accumulators with BF16 operands and backward.
+fp32_logits: false
+
 # Whether to use torch compile
 use_torch_compile: true
 

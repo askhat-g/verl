@@ -30,6 +30,8 @@ actor_rollout_ref:
       forward_prefetch: false
       use_orig_params: false
       mixed_precision: false
+      mixed_precision_param: null
+      fp32_logits: false
       use_torch_compile: true
       entropy_from_logits_with_chunking: false
       entropy_from_logits_chunk_size: 2048
@@ -179,6 +181,8 @@ actor_rollout_ref:
       forward_prefetch: false
       use_orig_params: false
       mixed_precision: false
+      mixed_precision_param: null
+      fp32_logits: false
       use_torch_compile: ${oc.select:actor_rollout_ref.actor.torchtitan.use_torch_compile,True}
       entropy_from_logits_with_chunking: false
       entropy_from_logits_chunk_size: 2048
@@ -523,6 +527,8 @@ critic:
     forward_prefetch: false
     use_orig_params: false
     mixed_precision: false
+    mixed_precision_param: null
+    fp32_logits: false
     use_torch_compile: true
     entropy_from_logits_with_chunking: false
     entropy_from_logits_chunk_size: 2048

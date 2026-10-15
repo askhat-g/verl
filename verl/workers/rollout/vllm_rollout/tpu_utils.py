@@ -1179,6 +1179,16 @@ def patch_vllm_for_tpu() -> None:
 
         def patched_init_worker(self, *args, **kwargs):
             patch_vllm_for_tpu()
+            from verl.utils.vllm.tpu_vllm_patch import (
+                patch_tpu_attention_fp32_stats,
+                patch_tpu_rms_norm,
+                patch_tpu_silu_and_mul,
+            )
+
+            # Worker environment variables arrive after the wrapper is constructed.
+            patch_tpu_attention_fp32_stats()
+            patch_tpu_silu_and_mul()
+            patch_tpu_rms_norm()
             if "vllm.utils.import_utils" not in sys.modules:
                 sys.modules["vllm.utils.import_utils"] = types.ModuleType("import_utils")
             sys.modules["vllm.utils.import_utils"].init_cached_hf_modules = lambda: None
@@ -1390,6 +1400,9 @@ def patch_vllm_for_tpu() -> None:
 
             for i, args in enumerate(all_args_to_update_environment_variables):
                 for name in env_vars_to_copy_list:
+                    if name in os.environ:
+                        args[name] = os.environ[name]
+                for name in ("VERL_TPU_VLLM_ATTN_FP32_STATS", "VERL_TPU_VLLM_RMSNORM_CUDA_ORDER"):
                     if name in os.environ:
                         args[name] = os.environ[name]
                 logger.debug(f"RayDistributedExecutor | Worker {i} environment variables before patch: {args}")
@@ -1649,6 +1662,8 @@ async def get_tpu_server_launch_config(workers):
                         # crash (b/501165531). See apply_tpu_vllm_patches().
                         "VLLM_DISABLE_COMPILE_CACHE",
                         "VERL_PLATFORM",
+                        "VERL_TPU_VLLM_ATTN_FP32_STATS",
+                        "VERL_TPU_VLLM_RMSNORM_CUDA_ORDER",
                         "XLA_FLAGS",
                     )
                 }
@@ -1882,6 +1897,9 @@ async def launch_tpu_vllm_servers(replica) -> None:
     }
     if "VERL_PLATFORM" in os.environ:
         env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
+    for name in ("VERL_TPU_VLLM_ATTN_FP32_STATS", "VERL_TPU_VLLM_RMSNORM_CUDA_ORDER"):
+        if name in os.environ:
+            env_vars[name] = os.environ[name]
     resource_pool = getattr(replica, "resource_pool", None)
     if resource_pool is not None and getattr(resource_pool, "pgs", None):
         try:

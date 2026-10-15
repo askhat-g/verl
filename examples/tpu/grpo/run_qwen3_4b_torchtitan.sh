@@ -6,6 +6,8 @@ set -xeuo pipefail
 
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
+export VERL_TPU_VLLM_ATTN_FP32_STATS="${VERL_TPU_VLLM_ATTN_FP32_STATS:-1}"
+export VERL_TPU_VLLM_RMSNORM_CUDA_ORDER="${VERL_TPU_VLLM_RMSNORM_CUDA_ORDER:-1}"
 export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-v6e}"
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VLLM_USE_V1=0
@@ -136,6 +138,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.use_torch_compile=True \
     actor_rollout_ref.actor.torchtitan.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.mixed_precision_param=float32 \
+    ++actor_rollout_ref.actor.torchtitan.fp32_logits=True \
     actor_rollout_ref.actor.torchtitan.use_splash_attention=True \
     actor_rollout_ref.actor.torchtitan.tpu_eager_mode=DEFER_AND_FUSE \
     actor_rollout_ref.actor.torchtitan.use_simple_fsdp=True \
@@ -147,6 +151,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.ref.torchtitan.mixed_precision_param=float32 \
+    ++actor_rollout_ref.ref.torchtitan.fp32_logits=True \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.torchtitan.tensor_parallel_size="${TENSOR_PARALLEL_SIZE}" \
@@ -164,6 +170,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.dtype=bfloat16 \
+    ++actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.head_dtype=float32 \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \

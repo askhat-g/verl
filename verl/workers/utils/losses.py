@@ -27,6 +27,43 @@ from verl.workers.engine.torchtitan.tpu_utils import select_and_to_padded_tensor
 from verl.workers.utils.padding import no_padding_2_padding
 
 
+def _ppo_token_diagnostics(config, log_prob, old_log_prob, response_mask):
+    """Report token-weighted PPO diagnostics without changing the loss or legacy metrics.
+
+    SUM over microbatches and MEAN over DP ranks recover a global token mean.
+    Signed KL and k3 use PPO's +/-20 log-ratio clamp; absolute gaps are raw.
+    Tiny negative k3 values from FP32 cancellation are rounded up to zero.
+    Bypass rejection sampling is excluded: its effective mask can differ from
+    the original mask counted by global_batch_info.batch_num_tokens.
+    """
+    batch_info = config.global_batch_info
+    if batch_info.get("batch_num_tokens") is None:
+        return {}
+    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+    if loss_mode == "bypass_mode":
+        correction = config.policy_loss.get("rollout_correction") or {}
+        if correction.get("loss_type", "ppo_clip") != "ppo_clip" or correction.get("rollout_rs") is not None:
+            return {}
+    elif loss_mode != "vanilla":
+        return {}
+
+    with torch.no_grad():
+        gap = log_prob.float() - old_log_prob.float()
+        gap = torch.where(response_mask.bool(), gap, torch.zeros_like(gap))
+        log_ratio = gap.clamp(-20.0, 20.0)
+        values = {
+            "actor/ppo_kl_token_mean": -log_ratio,
+            "actor/ppo_k3_token_mean": (log_ratio.exp() - log_ratio - 1.0).clamp_min(0.0),
+            "actor/logprob_gap_abs_token_mean": gap.abs(),
+        }
+        return {
+            name: Metric(
+                value=agg_loss(value, response_mask, "token-mean", **batch_info), aggregation=AggregationType.SUM
+            )
+            for name, value in values.items()
+        }
+
+
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     dp_size = tu.get_non_tensor_data(data=data, key="dp_size", default=1)
@@ -132,6 +169,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     pg_metrics = Metric.from_dict(pg_metrics, aggregation=AggregationType.MEAN)
 
     metrics.update(pg_metrics)
+    metrics.update(_ppo_token_diagnostics(config, log_prob, old_log_prob, response_mask))
     metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
     policy_loss = pg_loss
 
