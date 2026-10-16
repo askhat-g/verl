@@ -111,6 +111,9 @@ DEFAULT_IGNORE_FILES = (
     # and dispatches ``run_qwen3_0_6b_torchtitan.sh`` rather than defining a
     # model/train-backend recipe directly.
     "examples/tpu/grpo/run_grpo_v5p_nap.sh",
+    # Rollout-only (inference) benchmark of the ReTool recipe — no train-backend
+    # in the name.
+    "examples/tpu/inference/run_qwen3_32b_retool_rollout.sh",
 )
 
 
