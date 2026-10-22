@@ -252,6 +252,67 @@ def patch_multiprocessing_for_tpu() -> None:
     multiprocessing.process.BaseProcess._tpu_patched = True
 
 
+# Folded MoE expert stacks sent by raiden_checkpoint_engine.export_local_shards (expert_stack_wire):
+# "<prefix>.experts.gate_proj.weight" / ".up_proj.weight" [E * I, H] and ".down_proj.weight" [E * H, I].
+_RAIDEN_EXPERT_SUFFIXES = (".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")
+
+
+def _raiden_resolve_name(name: str, table) -> Optional[str]:
+    """``name`` as a key of ``table`` (state_dict or named_modules dict), tolerating a missing / extra ``model.``."""
+    for key in (name, name[6:] if name.startswith("model.") else None, f"model.{name}"):
+        if key is not None and key in table:
+            return key
+    return None
+
+
+def _raiden_expert_stack_prefix(name: str) -> Optional[str]:
+    """``model.layers.N.mlp.experts`` if ``name`` is a folded expert stack, else None."""
+    for suffix in _RAIDEN_EXPERT_SUFFIXES:
+        if name.endswith(".experts" + suffix):
+            return name[: -len(suffix)]
+    return None
+
+
+def _raiden_routed_experts(module_dict: dict, prefix: str):
+    """``(name, module)`` of the vLLM module holding MoE block ``prefix``'s fused ``w13_weight`` / ``w2_weight``.
+
+    vLLM >= 0.2x wraps them as ``<prefix>.routed_experts`` (MoERunner -> RoutedExperts); older FusedMoE held them
+    directly on ``<prefix>``.
+    """
+    for cand in (f"{prefix}.routed_experts", prefix):
+        key = _raiden_resolve_name(cand, module_dict)
+        if key is not None and hasattr(module_dict[key], "w13_weight") and hasattr(module_dict[key], "w2_weight"):
+            return key, module_dict[key]
+    return None, None
+
+
+def _raiden_fused_expert_weights(
+    gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor, half: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build vLLM-TPU's fused expert weights from per-expert HF blocks.
+
+    ``gate`` / ``up``: ``[E_local, I, H]``, ``down``: ``[E_local, H, I]`` (HF ``[out, in]`` per expert). vllm_torchtpu
+    (VllmUnquantizedFusedMoEMethod.process_weights_after_loading) stores ``w13 = [gate^T | 0 | up^T | 0]``
+    ``[E_local, H, 2 * half]`` with each half zero padded to ``half`` columns, and ``w2 = [down^T ; 0]``
+    ``[E_local, half, H]``.
+    """
+    inter = int(gate.shape[1])
+    pad = int(half) - inter
+    if pad < 0:
+        raise RuntimeError(f"Raiden MoE: received intermediate size {inter} exceeds vLLM's fused half {half}")
+    gate_t = gate.transpose(1, 2).contiguous()
+    up_t = up.transpose(1, 2).contiguous()
+    down_t = down.transpose(1, 2).contiguous()
+    if pad:
+        zeros = gate_t.new_zeros((*gate_t.shape[:-1], pad))
+        w13 = torch.cat([gate_t, zeros, up_t, zeros], dim=-1)
+        w2 = torch.cat([down_t, down_t.new_zeros((down_t.shape[0], pad, down_t.shape[2]))], dim=1)
+    else:
+        w13 = torch.cat([gate_t, up_t], dim=-1)
+        w2 = down_t
+    return w13.contiguous(), w2.contiguous()
+
+
 class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
     """vLLM Worker Extension for Google Cloud TPU with Raiden P2P weight synchronization.
 
@@ -347,6 +408,13 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         num_kv_heads = worker.vllm_config.model_config.get_total_num_kv_heads()
         kv_head_idx = get_tensor_model_parallel_rank() // (tp_size // num_kv_heads) if num_kv_heads < tp_size else None
 
+        # vLLM's own parameters, to spot weights it keeps whole on every rank (e.g. the MoE router mlp.gate, a
+        # ReplicatedLinear) and the fused MoE expert modules (whose EP rank must equal this TP rank).
+        tp_rank = get_tensor_model_parallel_rank()
+        model_sd = vllm_model.state_dict() if hasattr(vllm_model, "state_dict") else vllm_model.model.state_dict()
+        module_dict = dict(vllm_model.named_modules()) if hasattr(vllm_model, "named_modules") else {}
+        self._raiden_moe_layers = {}
+
         staging_tensors = {}
         variable_protos = []
         valid_params = []
@@ -358,9 +426,21 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             local_shape = list(g_shape)
             tp_axis_size = tp_size  # number of slices along the "tp" mesh axis
             global_shard_indices = []  # empty = tpu-sync derives this rank's slice from the mesh geometry
+            moe_prefix = _raiden_expert_stack_prefix(name)
+            vllm_key = _raiden_resolve_name(name, model_sd) if moe_prefix is None else None
+            vllm_shape = list(model_sd[vllm_key].shape) if vllm_key is not None else None
 
-            if len(g_shape) == 2:
-                if any(name.endswith(s) for s in ROW_PARALLEL_SUFFIXES):
+            if moe_prefix is not None:
+                # Folded expert stack [E * rows, cols]: under linear expert parallelism over the TP group this
+                # rank owns experts [r * E / tp, (r + 1) * E / tp), a plain dim-0 block of whole experts.
+                self._raiden_register_moe_stack(module_dict, moe_prefix, name, g_shape, tp_size, tp_rank)
+                spec_axes = ["tp", ""]
+                local_shape[0] = g_shape[0] // tp_size
+            elif len(g_shape) == 2:
+                if tp_size > 1 and vllm_shape is not None and vllm_shape in (g_shape, g_shape[::-1]):
+                    # vLLM keeps this weight whole on every rank (e.g. the MoE router): receive it replicated.
+                    pass
+                elif any(name.endswith(s) for s in ROW_PARALLEL_SUFFIXES):
                     # Row parallel: partition input dimension (dim 1) across TP ranks
                     spec_axes = ["", "tp"]
                     local_shape[1] = g_shape[1] // tp_size
@@ -456,6 +536,51 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         return True
 
+    def _raiden_register_moe_stack(
+        self, module_dict: dict, prefix: str, name: str, g_shape: list, tp_size: int, tp_rank: int
+    ) -> None:
+        """Check that folded expert stack ``name`` can be received as a dim-0 shard and record its vLLM module.
+
+        Supported: vLLM fused MoE (RoutedExperts) with linear expert parallelism over the whole TP group
+        (``enable_expert_parallel`` with expert_parallel_size == tensor_parallel_size), unquantized, silu-style
+        activation (no swigluoai interleave), no expert bias. Anything else fails closed here, at the first sync.
+        Without EP, each rank holds an intermediate-dim slice of every expert, which a 2-D folded stack cannot
+        express (it needs a 3-D variable split on the intermediate dim).
+        """
+        key, experts = _raiden_routed_experts(module_dict, prefix)
+        if experts is None:
+            raise RuntimeError(f"Raiden Sampler: no vLLM fused-MoE module (w13_weight / w2_weight) for {name}")
+        moe_cfg = getattr(experts, "moe_config", None)
+        num_experts = int(getattr(experts, "global_num_experts", 0) or 0)
+        num_local = int(getattr(experts, "local_num_experts", 0) or 0)
+        use_ep = bool(getattr(experts, "use_ep", False))
+        ep_size = int(getattr(moe_cfg, "ep_size", 0) or 0)
+        ep_rank = int(getattr(moe_cfg, "ep_rank", -1))
+        placement = getattr(experts, "expert_placement_strategy", "linear")
+        if not (
+            use_ep
+            and ep_size == tp_size
+            and ep_rank == tp_rank
+            and placement == "linear"
+            and num_experts > 0
+            and num_experts % tp_size == 0
+            and num_local * tp_size == num_experts
+            and g_shape[0] % num_experts == 0
+        ):
+            raise NotImplementedError(
+                f"Raiden MoE weight sync needs linear expert parallelism over the whole TP group "
+                f"(enable_expert_parallel, expert_parallel_size == tensor_parallel_size == {tp_size}); {key} has "
+                f"use_ep={use_ep}, ep_size={ep_size}, ep_rank={ep_rank} (tp_rank={tp_rank}), placement={placement}, "
+                f"local/global experts={num_local}/{num_experts}, received {name} {g_shape}"
+            )
+        activation = str(getattr(experts, "activation", "")).lower()
+        if "swigluoai" in activation or getattr(moe_cfg, "has_bias", False):
+            raise NotImplementedError(f"Raiden MoE: {key} uses activation={activation} / expert bias, not supported")
+        w13, w2 = experts.w13_weight, experts.w2_weight
+        if w13.ndim != 3 or w2.ndim != 3 or int(w13.shape[0]) != num_local or int(w2.shape[0]) != num_local:
+            raise RuntimeError(f"Raiden MoE: unexpected {key} w13 {tuple(w13.shape)} / w2 {tuple(w2.shape)}")
+        self._raiden_moe_layers[prefix] = key
+
     @torch.no_grad()
     def install_raiden_weights(self, exact_parity: bool = False) -> dict:
         """Install received weights from host staging buffer into TPU HBM via zero-copy H2D DMA
@@ -531,6 +656,36 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             from verl.checkpoint_engine.raiden_checkpoint_engine import RaidenParityCheck
 
             parity = RaidenParityCheck("exact")
+        # vLLM state_dict keys written by this install; checked against the model's parameters at the end.
+        written_keys = set()
+        rank_id = getattr(self, "rank", 0)
+
+        # 0. Fused MoE experts: unfold this rank's whole-expert blocks into vLLM's w13_weight / w2_weight
+        for prefix, mod_key in (getattr(self, "_raiden_moe_layers", None) or {}).items():
+            experts = module_dict[mod_key]
+            src_keys = [prefix + s for s in _RAIDEN_EXPERT_SUFFIXES]
+            gate, up, down = (self._raiden_staging[k] for k in src_keys)
+            w13, w2 = experts.w13_weight, experts.w2_weight
+            n_local, hidden = int(w13.shape[0]), int(w13.shape[1])
+            inter = int(gate.shape[0]) // n_local
+            new13, new2 = _raiden_fused_expert_weights(
+                gate.view(n_local, inter, hidden),
+                up.view(n_local, inter, hidden),
+                down.view(n_local, hidden, inter),
+                half=int(w13.shape[-1]) // 2,
+            )
+            if new13.shape != w13.shape or new2.shape != w2.shape:
+                raise RuntimeError(
+                    f"Raiden MoE: {mod_key} built w13 {tuple(new13.shape)} / w2 {tuple(new2.shape)} from {prefix}, "
+                    f"vLLM has {tuple(w13.shape)} / {tuple(w2.shape)}"
+                )
+            if parity:
+                parity.check_exact(f"{mod_key}.w13_weight", w13, new13)
+                parity.check_exact(f"{mod_key}.w2_weight", w2, new2)
+            w13.copy_(new13)
+            w2.copy_(new2)
+            written_keys.update((f"{mod_key}.w13_weight", f"{mod_key}.w2_weight"))
+            consumed_staging.update(src_keys)
 
         # 1. Handle fused projections (QKV and Gate-Up)
         for target_suffix, src_suffixes in FUSED_MAP:
@@ -554,6 +709,7 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
                             if parity:
                                 parity.check_exact(resolved_key, target_local, fused_adapted)
                             target_local.copy_(fused_adapted)
+                            written_keys.add(resolved_key)
                             consumed_staging.update(layer_src_keys)
 
         # 2. Handle all remaining non-fused parameters (o_proj, down_proj, layernorms, embeddings)
@@ -571,6 +727,7 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
                 if parity:
                     parity.check_exact(resolved_key, target_local, adapted)
                 target_local.copy_(adapted)
+                written_keys.add(resolved_key)
             else:
                 unresolved.append(name)
 
@@ -589,6 +746,20 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         elif hasattr(vllm_model, "lm_head") and hasattr(vllm_model, "embed_tokens"):
             if vllm_model.lm_head.weight.data_ptr() != vllm_model.embed_tokens.weight.data_ptr():
                 vllm_model.lm_head.weight.copy_(vllm_model.embed_tokens.weight)
+        if not received_lm_head and hasattr(vllm_model, "lm_head"):
+            written_keys.add(resolve_model_key("lm_head.weight") or "lm_head.weight")
+
+        # 4. Every vLLM parameter must have been written: one the trainer never sent would silently keep its
+        #    initial (HF checkpoint) value for the whole run while the trainer's copy moves on.
+        missing = [n for n, _ in vllm_model.named_parameters() if n not in written_keys]
+        if missing:
+            msg = (
+                f"Raiden Sampler Rank {rank_id}: {len(missing)} of the vLLM model's parameters received no weights "
+                f"and keep their initial values: {missing[:8]}"
+            )
+            if os.environ.get("VERL_RAIDEN_ALLOW_MISSING", "0") != "1":
+                raise RuntimeError(msg + " (set VERL_RAIDEN_ALLOW_MISSING=1 to only warn)")
+            logging.getLogger(__name__).warning(msg)
 
         t_sync_start = time.perf_counter()
         try:
@@ -1930,6 +2101,12 @@ async def launch_tpu_vllm_servers(replica) -> None:
         if resolved:
             env_vars[flag_var] = resolved
             flags_to_copy.add(flag_var)
+
+    # Raiden switches read inside the vLLM workers (VERL_RAIDEN_ALLOW_MISSING in install_raiden_weights): vLLM's
+    # Ray workers do not inherit the job env.
+    for raiden_var in (k for k in os.environ if k.startswith("VERL_RAIDEN_")):
+        env_vars[raiden_var] = os.environ[raiden_var]
+        flags_to_copy.add(raiden_var)
 
     if flags_to_copy:
         copy_var = "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"

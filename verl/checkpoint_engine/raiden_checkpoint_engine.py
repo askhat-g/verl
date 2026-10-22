@@ -16,6 +16,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Any, Generator, Iterable, Optional
 
@@ -170,6 +171,14 @@ def validate_and_sanitize_tensors(
         if not t.is_contiguous():
             t = t.contiguous()
 
+        # tpu-sync raw transfer binds the tensor's whole device storage, so a view onto part of a larger
+        # buffer (non-zero offset or a smaller extent) is rejected; give such tensors their own buffer.
+        try:
+            if t.storage_offset() != 0 or t.untyped_storage().nbytes() != t.numel() * t.element_size():
+                t = t.clone()
+        except Exception:
+            pass
+
         sanitized.append((name, t))
 
     return sanitized
@@ -196,6 +205,42 @@ def _dim0_shard_info(spec) -> Optional[tuple[tuple, int, int]]:
     return tuple(place.local_shape), num_shards, int(place.global_offset[0]) // (full_dim0 // num_shards)
 
 
+_EXPERT_SLOT_RE = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<suffix>[^.]+\.weight)$")
+
+
+def expert_stack_wire(name: str, spec) -> tuple[str, tuple[int, int]]:
+    """Name and 2-D shape under which an identity-split MoE expert stack is sent to the samplers.
+
+    torchtitan exports each MoE layer's routed experts as one stack per projection (``layers.0.moe.experts.w1_EFD``
+    ``[num_experts, moe_inter, hidden]``, ``w3_EFD`` likewise, ``w2_EDF`` ``[num_experts, hidden, moe_inter]``) with
+    ``spec.hf_slots`` naming every expert's HF tensor, slot ``e`` being ``full[e]`` (no converter). The stack is sent
+    as ONE variable with the experts folded into rows, ``[num_experts * rows, cols]``, named after its HF slots
+    without the expert index (``model.layers.0.mlp.experts.gate_proj.weight``). FSDP ``Shard(0)`` holds whole
+    experts, so the local shard stays a contiguous dim-0 block and Raiden reshards it like a dense weight; the
+    sampler unfolds it into vLLM's fused ``w13_weight`` / ``w2_weight`` (``vLLMRaidenWorkerExtension``).
+    Anything else fails closed.
+    """
+    full_shape = tuple(int(d) for d in spec.full_shape)
+    slots = spec.hf_slots
+    if spec.to_hf_chunk is not None or len(full_shape) != 3 or len(slots) != full_shape[0]:
+        raise NotImplementedError(
+            f"Raiden export: unsupported expert stack {name} (shape {full_shape}, {len(slots)} slots, "
+            f"converter={spec.to_hf_chunk is not None})"
+        )
+    wire_names = set()
+    for e, (slot_name, slot_shape) in enumerate(slots):
+        m = _EXPERT_SLOT_RE.match(slot_name)
+        if m is None or int(m["idx"]) != e or tuple(int(d) for d in slot_shape) != full_shape[1:]:
+            raise NotImplementedError(
+                f"Raiden export: expert stack {name} slot {e} is {slot_name} {tuple(slot_shape)}, expected "
+                f"'<prefix>.experts.{e}.<proj>.weight' of shape {full_shape[1:]}"
+            )
+        wire_names.add(f"{m['prefix']}.{m['suffix']}")
+    if len(wire_names) != 1:
+        raise NotImplementedError(f"Raiden export: expert stack {name} spans several projections {sorted(wire_names)}")
+    return wire_names.pop(), (full_shape[0] * full_shape[1], full_shape[2])
+
+
 def export_local_shards(
     engine, tie_word_embeddings: bool = True
 ) -> tuple[list[tuple[str, torch.Tensor]], dict[str, tuple[int, int]]]:
@@ -204,7 +249,8 @@ def export_local_shards(
     Returns ``(named_tensors, shard_info)``. ``shard_info[name] = (num_shards, shard_index)`` for tensors
     exported as a local dim-0 shard; tensors absent from it are full (replicated) on every rank. Tensors
     whose layout Raiden cannot express are all-gathered here, in the same order on every rank.
-    ``lm_head.weight`` is dropped only for tied models (see ``filter_tied_embeddings``).
+    ``lm_head.weight`` is dropped only for tied models (see ``filter_tied_embeddings``). MoE expert stacks are
+    sent folded to 2-D under their HF projection name (see ``expert_stack_wire``).
     """
     from torch.distributed.tensor import DTensor
 
@@ -217,21 +263,30 @@ def export_local_shards(
 
     named, shard_info = [], {}
     for name, (local, spec) in items:
-        if spec.place is not None or spec.hf_slots is not None:
-            raise NotImplementedError(
-                f"Raiden sharded export does not support exporter-defined placements or expert stacks ({name})"
-            )
+        if spec.place is not None:
+            raise NotImplementedError(f"Raiden sharded export does not support exporter-defined placements ({name})")
         full_shape = tuple(int(d) for d in spec.full_shape)
+        wire_name, wire_shape = name, full_shape
+        if spec.hf_slots is not None:
+            wire_name, wire_shape = expert_stack_wire(name, spec)
         info = _dim0_shard_info(spec)
         if info is not None:
             local_shape, num_shards, shard_index = info
-            named.append((name, local.view(local_shape)))
-            shard_info[name] = (num_shards, shard_index)
+            if wire_shape != full_shape:
+                # whole experts folded into rows: still a contiguous dim-0 block of the 2-D wire tensor.
+                # tpu-sync binds each tensor's device storage as-is and rejects a view whose leading (block)
+                # dim differs from its storage's, so the folded stack gets its own 2-D buffer (one extra copy
+                # of this rank's expert shards, freed with the synchronizer after the sync).
+                local_shape = (int(local_shape[0]) * full_shape[1], full_shape[2])
+                named.append((wire_name, local.reshape(local_shape).clone()))
+            else:
+                named.append((wire_name, local.view(local_shape)))
+            shard_info[wire_name] = (num_shards, shard_index)
             continue
         place = derive_dtensor_placement(spec)[0] if spec.mesh is not None else 0
         if not isinstance(place, BlockPlacement):
             # unsharded or fully replicated: the local tensor is already the full parameter
-            named.append((name, local.view(full_shape)))
+            named.append((wire_name, local.view(wire_shape)))
             continue
         strides = [1] * len(full_shape)
         for d in range(len(full_shape) - 2, -1, -1):
@@ -244,7 +299,7 @@ def export_local_shards(
             shape=torch.Size(full_shape),
             stride=tuple(strides),
         )
-        named.append((name, dt.full_tensor()))
+        named.append((wire_name, dt.full_tensor().reshape(wire_shape)))
     return named, shard_info
 
 

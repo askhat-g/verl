@@ -62,6 +62,7 @@ from verl.workers.engine.torchtitan.tpu_utils import (
     compute_global_batch_num_tokens,
     configure_torch_compile_for_tpu,
     gather_cp_1d,
+    get_tpu_seq_bucket_size,
     make_spmd_safe_parallelize_fn,
     monkey_patch_varlen_attention_tpu,
     pad_packed_inputs_for_tpu,
@@ -73,6 +74,7 @@ from verl.workers.engine.torchtitan.tpu_utils import (
 )
 from verl.workers.engine.torchtitan.utils import (
     NoOpDataLoader,
+    configure_qwen3_moe_for_rl,
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
     get_attention_masks,
@@ -167,6 +169,15 @@ class TorchTitanEngine(BaseEngine):
         )
         model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
         model_spec = model_module.model_registry(torchtitan_flavor, attn_backend=attn_backend)
+        if torchtitan_name == "qwen3":
+            # MoE flavors only: route like the HF checkpoint the rollout serves (no expert bias, no aux loss)
+            # and, on TPU, run the routed experts with the Pallas grouped matmul. Dense flavors are unchanged.
+            model_spec.model = configure_qwen3_moe_for_rl(
+                model_spec.model,
+                use_pallas_grouped_mm=device_name == "tpu",
+                expert_parallel_size=self.engine_config.expert_parallel_size,
+                token_multiple=get_tpu_seq_bucket_size(),
+            )
         self._use_simple_fsdp = self.engine_config.use_simple_fsdp
         if self._use_simple_fsdp:
             model_spec.parallelize_fn = make_simple_fsdp_parallelize_fn(

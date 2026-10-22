@@ -148,6 +148,101 @@ def derive_torchtitan_name_and_flavor(hf_config) -> tuple[str, str]:
     )
 
 
+# Row tile of the MegaBlox grouped matmul that runs the routed experts on TPU. MegaBlox requires the routed
+# row count (tokens * top_k) to be a multiple of it.
+_TPU_PALLAS_GROUPED_MM_TILE_M = 256
+
+
+def configure_qwen3_moe_for_rl(
+    model_config,
+    *,
+    use_pallas_grouped_mm: bool,
+    expert_parallel_size: int = 1,
+    token_multiple: int = 1,
+):
+    """Adapt a torchtitan Qwen3 MoE model config for RL against an HF-format rollout engine.
+
+    Returns ``model_config`` unchanged for dense flavors (no ``MoE.Config`` in the tree).
+
+    Load balancing: torchtitan's Qwen3 MoE flavors balance experts without an aux loss
+    (``MoE.Config.load_balance_coeff=1e-3``): the ModelSpec's ``post_optimizer_build_fn``
+    (``register_moe_load_balancing_hook``, registered by torchtitan's Trainer) nudges a per-layer
+    ``expert_bias_E`` before every optimizer step, and the router adds that bias to the scores it picks the
+    top-k experts from. HF Qwen2/Qwen3 MoE checkpoints have no such bias and ``Qwen3StateDictAdapter.to_hf``
+    drops it, so the rollout engine (and the ref model) never see it: from the second step on the actor would
+    route tokens to other experts than the rollout that sampled them. The ``*-global-aux`` flavors instead
+    inject an aux-loss gradient through a custom autograd function, outside verl's policy loss and scaled for
+    torchtitan's batch accounting. Both are cleared so the trainer routes exactly like the HF model.
+    ``model_registry`` does not forward flavor kwargs, so the built config is edited, as torchtitan's TPU
+    235B-A22B recipe does (``experiments/tpu/qwen3/config_registry.py``).
+
+    Routed experts on TPU (``use_pallas_grouped_mm``): swaps ``GroupedExperts`` for torchtitan's
+    ``TpuGroupedExperts`` with the MegaBlox Pallas grouped matmul, as torchtitan's Qwen3-30B-A3B TPU recipe
+    does, because the native ``torch._grouped_mm`` backward computes a wrong expert dWeight on TPU
+    (torch_tpu#2668, see ``experiments/tpu/grouped_experts.py``). The parameters keep the canonical
+    ``w1_EFD``/``w2_EDF``/``w3_EFD`` layout (no state-dict hooks, so checkpoint, HF conversion and weight
+    sync are unchanged) and use the unpaired kernel with full K/N dWeight tiles (fp32 accumulation), the
+    torchtitan TPU recipe's setting before its paired W1/W3 variant. Needs EP=1 (exact routed-row dispatch; EP>1
+    raises, since the native fallback's dWeight is wrong) and a routed row count that is a multiple of the 256-row
+    tile.
+
+    Args:
+        model_config: torchtitan model config (``ModelSpec.model``), edited in place.
+        use_pallas_grouped_mm: Run the routed experts with the TPU Pallas grouped matmul.
+        expert_parallel_size: Expert parallel degree; must be 1 when ``use_pallas_grouped_mm`` (raises otherwise).
+        token_multiple: Every micro-batch's token count is a multiple of this (the TPU sequence bucket).
+
+    Returns:
+        The edited model config.
+    """
+    from torchtitan.models.common.moe import MoE
+
+    moe_configs = [moe for _, moe, _, _ in model_config.traverse(MoE.Config)]
+    if not moe_configs:
+        return model_config
+    for moe in moe_configs:
+        moe.load_balance_coeff = None
+        moe.aux_loss = None
+    logger.warning("MoE: disabled expert-bias load balancing and aux loss on %d layers", len(moe_configs))
+
+    if not use_pallas_grouped_mm:
+        return model_config
+    if expert_parallel_size > 1:
+        # EP dispatch yields ragged routed-row counts that are not 256-tile aligned, so the Pallas kernel cannot
+        # run (torchtitan's TPU TpuGroupedExperts also rejects EP for its paired variant), and the native
+        # torch._grouped_mm fallback computes a wrong expert dWeight on TPU: refuse instead of training silently
+        # with wrong expert gradients.
+        raise ValueError(
+            f"expert_parallel_size={expert_parallel_size} is not supported for Qwen3 MoE on TPU: the Pallas grouped "
+            "matmul needs EP=1 (exact, tile-aligned routed rows), and the native torch._grouped_mm fallback computes "
+            "a wrong expert dWeight on TPU (torch_tpu#2668). Use expert_parallel_size=1 with FSDP "
+            "(data_parallel_shard_size) instead."
+        )
+
+    from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts, TpuGroupedExpertsConverter
+
+    tile_m = _TPU_PALLAS_GROUPED_MM_TILE_M
+    token_multiple = max(int(token_multiple), 1)  # bucket sizes <= 1 disable bucketing
+    for moe in moe_configs:
+        if (token_multiple * moe.router.top_k) % tile_m:
+            raise ValueError(
+                f"The Pallas grouped matmul needs tokens * top_k to be a multiple of {tile_m}, but token counts "
+                f"are only guaranteed to be multiples of {token_multiple} (top_k={moe.router.top_k}). Set "
+                f"VERL_TPU_SEQ_BUCKET_SIZE so that it times top_k is a multiple of {tile_m} (the default 256 is)."
+            )
+    model_config = TpuGroupedExpertsConverter.Config().build().convert(model_config)
+    n_experts = 0
+    for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
+        experts.use_pallas_grouped_mm = True
+        experts.use_pallas_paired_grouped_mm = False  # paired W1/W3 is a later perf variant
+        experts.use_kernel_native_weight_layout = False  # keep canonical param names and layout
+        experts.pallas_grouped_mm_tile_m = tile_m
+        experts.pallas_grouped_mm_tgmm_tiling = (tile_m, 0, 0)  # full K/N dWeight tiles
+        n_experts += 1
+    logger.warning("MoE: routed experts on %d layers use the Pallas grouped matmul (tile_m=%d)", n_experts, tile_m)
+    return model_config
+
+
 def enable_fsdp_gradient_division(model: nn.Module, dp_size: int) -> None:
     """
     Re-enable FSDP's automatic gradient division.
@@ -189,18 +284,24 @@ def make_simple_fsdp_parallelize_fn(parallelize_fn, *, spmd_safe_blocks: bool = 
 
     Args:
         parallelize_fn: The model's torchtitan ``parallelize_fn`` (must accept ``skip_dp``).
-        spmd_safe_blocks: Mark each TransformerBlock ``spmd_safe`` (torch_tpu) so the collectives traced into
-            the compiled blocks run as SPMD collectives. Needed on TPU with ``torch.compile``.
+        spmd_safe_blocks: Mark each dense TransformerBlock ``spmd_safe`` (torch_tpu) so the collectives traced
+            into the compiled blocks run as SPMD collectives. Needed on TPU with ``torch.compile``. Blocks that
+            contain an ``MoE`` stay unmarked, as in torchtitan's TPU Qwen3 recipe: their routing is data
+            dependent (with EP, host-synced all-to-all splits), so ranks are not guaranteed identical programs.
     """
     from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
     from torchtitan.experiments.graph_trainer.simple_fsdp import disable_active_parametrization
 
     def _parallelize(model: nn.Module, *, parallel_dims, training, compile_config, **kwargs) -> nn.Module:
+        n_spmd_safe = 0
         if spmd_safe_blocks and compile_config.enable and hasattr(model, "layers"):
             from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
+            from torchtitan.models.common.moe import MoE
 
             for block in model.layers.values():
-                apply_spmd_safe(block)
+                if not any(isinstance(m, MoE) for m in block.modules()):
+                    apply_spmd_safe(block)
+                    n_spmd_safe += 1
 
         kwargs.pop("skip_dp", None)
         model = parallelize_fn(
@@ -218,7 +319,7 @@ def make_simple_fsdp_parallelize_fn(parallelize_fn, *, spmd_safe_blocks: bool = 
                 return init_weights(*args, **init_kwargs)
 
         model.init_weights = _init_weights
-        logger.info("Applied SimpleFSDP (weight tying preserved: %s, spmd_safe blocks: %s)", tied, spmd_safe_blocks)
+        logger.info("Applied SimpleFSDP (weight tying preserved: %s, spmd_safe blocks: %d)", tied, n_spmd_safe)
         return model
 
     return _parallelize

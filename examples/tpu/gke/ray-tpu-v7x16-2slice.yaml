@@ -1,0 +1,165 @@
+---
+# KubeRay RayCluster for verl GRPO on GKE cluster torchtpu-v7x-80 (project tpu-pytorch, us-central1):
+# one TPU 7x (Ironwood) 2x2x4 slice for the TorchTitan trainer and one for vLLM rollout.
+#
+#   * 1 CPU Ray head on default-pool (n2-standard-8; most of its CPU is already requested by system pods,
+#     so the head requests little and bursts up to its limits). It advertises 12 logical CPUs to Ray so the
+#     verl TaskRunner (driver, num_cpus=10) is scheduled on the head, not on a TPU host.
+#   * 2 slices (tpu-group-0 = trainer, tpu-group-1 = rollout) of 2x2x4 = 4 hosts x 4 chips = 16 chips each.
+#     Every TPU 7x chip has 2 TensorCores, which torch_tpu exposes as 2 devices, so each host provides
+#     8 devices (Ray resource TPU: 8) and each slice 32 devices (TORCH_TPU_TOPOLOGY=2,2,4,2).
+#   * The slices come from the torchtpu-v7x-16chip-* node pools (autoscaling 0 -> 4 nodes, reservation
+#     cloudtpu-20260721185000-2044356019, shared by all TPU pools of the cluster: 80 chips in total).
+#
+# Compared with ray-tpu-v6e8-2slice.yaml: no cluster-admin ClusterRoleBinding (shared cluster, and verl does not
+# call the Kubernetes API), tpu7x node selector / topology, numOfHosts 4, TPU: 8 per host, larger host memory,
+# TPU_ACCELERATOR_TYPE=tpu7x, and a small head that fits the shared default-pool.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ray-ksa
+  namespace: default # Change this if your Ray cluster is in a different namespace
+  annotations:
+    # Workload Identity: ray-tpu-gsa has roles/storage.objectAdmin on gs://torchprime and
+    # roles/iam.workloadIdentityUser for tpu-pytorch.svc.id.goog[default/ray-ksa].
+    iam.gke.io/gcp-service-account: ray-tpu-gsa@tpu-pytorch.iam.gserviceaccount.com
+---
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ray-tpu-v7x16-cluster
+  namespace: default
+  # No kueue.x-k8s.io/queue-name label: the cluster's ClusterQueues (cq-16chip etc.) only cover google.com/tpu, so
+  # Kueue cannot admit Ray pods that request cpu/memory ("couldn't assign flavors to pod set head: resource memory
+  # unavailable in ClusterQueue"). Kueue does not manage unlabeled workloads (manageJobsWithoutQueueName is off).
+spec:
+  headGroupSpec:
+    rayStartParams:
+      # Logical CPUs for Ray scheduling, not a Kubernetes request. verl's TaskRunner (the driver) asks for
+      # num_cpus=10 (DEFAULT_TASK_RUNNER_CPUS in verl/plugin/platform/platform_tpu_workarounds.py). With fewer
+      # than 10 here it cannot fit on the head and lands on a TPU host. On a trainer host, the pre-fix
+      # PlatformTPU.get_tpu_env_vars then gives every trainer rank only that host's TPU addresses (I-26), and
+      # the driver's `import torch` can grab that host's TPU (I-12). 12 = 10 for the TaskRunner + 2 spare.
+      # Physical CPU stays bounded by the container limit below (the TaskRunner is mostly idle).
+      num-cpus: "12"
+    template:
+      metadata:
+        annotations:
+          gke-gcsfuse/volumes: "true"
+          # default-pool has ~1 vCPU unrequested; keep the gcsfuse sidecar's requests small (no limits).
+          gke-gcsfuse/cpu-request: "100m"
+          gke-gcsfuse/memory-request: "256Mi"
+          gke-gcsfuse/cpu-limit: "0"
+          gke-gcsfuse/memory-limit: "0"
+      spec:
+        serviceAccountName: ray-ksa
+        nodeSelector:
+          cloud.google.com/gke-nodepool: default-pool
+        containers:
+          - name: ray-head
+            image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261001-tsync990787257
+            imagePullPolicy: Always
+            env:
+            - name: RAY_TRAIN_V2_ENABLED
+              value: "1"
+            - name: TPU_ACCELERATOR_TYPE
+              value: "tpu7x"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-secret
+                  key: hf_token
+                  optional: true
+            ports:
+              - containerPort: 8265  # Dashboard
+              - containerPort: 10001 # Client
+              - containerPort: 8888  # gRPC
+              - containerPort: 8000  # OpenAI API
+            resources:
+              requests:
+                cpu: "500m"
+                memory: "8Gi"
+              limits:
+                cpu: "6"
+                memory: "24Gi"
+            volumeMounts:
+            - name: gcs-volume
+              mountPath: /data
+            - name: host-tmp
+              mountPath: /tmp
+        volumes:
+        - name: gcs-volume
+          csi:
+            driver: gcsfuse.csi.storage.gke.io
+            volumeAttributes:
+              bucketName: torchprime
+              mountOptions: "implicit-dirs"
+        - name: host-tmp
+          hostPath:
+            path: /tmp
+  workerGroupSpecs:
+    - replicas: 2 # 2 slices of 2x2x4 (tpu-group-0 for the trainer, tpu-group-1 for rollout)
+      minReplicas: 2
+      maxReplicas: 2
+      numOfHosts: 4 # 4 VM hosts per 2x2x4 slice (16 chips = 32 TensorCore devices per slice)
+      groupName: tpu-group
+      rayStartParams:
+        # Each TPU 7x host has 4 chips = 8 TensorCore devices.
+        resources: '"{\"TPU\": 8}"'
+      template:
+        metadata:
+          annotations:
+            gke-gcsfuse/volumes: "true"
+        spec:
+          serviceAccountName: ray-ksa
+          containers:
+            - name: ray-worker
+              image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261001-tsync990787257
+              imagePullPolicy: Always
+              resources:
+                # tpu7x-standard-4t allocatable: ~223 vCPU, ~919 GiB memory, 4 chips.
+                limits:
+                  memory: "800Gi"
+                  google.com/tpu: "4"
+                requests:
+                  cpu: "200"
+                  memory: "800Gi"
+                  google.com/tpu: "4"
+              env:
+                - name: RAY_TRAIN_V2_ENABLED
+                  value: "1"
+                # Must be a full pod type (<gen>-<cores>), not just "tpu7x": Ray only creates the per-slice
+                # resources tpu-group-N (from TPU_NAME) and TPU-v7x-32-head when this matches
+                # ^(v|tpu)\d+[a-zA-Z]*-\d+$. Without them verl's auto_assign_accelerator_type falls back to
+                # node:<ip> pinning and every trainer placement group asks for the same host (deadlock).
+                # The job runtime env (q30/submit.sh) still sets TPU_ACCELERATOR_TYPE=tpu7x for verl processes.
+                - name: TPU_ACCELERATOR_TYPE
+                  value: "tpu7x-32"
+                - name: RAY_memory_monitor_refresh_ms
+                  value: "0"
+                - name: RAY_memory_usage_threshold
+                  value: "0.99"
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-secret
+                      key: hf_token
+                      optional: true
+              volumeMounts:
+              - name: gcs-volume
+                mountPath: /data
+              - name: host-tmp
+                mountPath: /tmp
+          volumes:
+          - name: gcs-volume
+            csi:
+              driver: gcsfuse.csi.storage.gke.io
+              volumeAttributes:
+                bucketName: torchprime
+                mountOptions: "implicit-dirs"
+          - name: host-tmp
+            hostPath:
+              path: /tmp
+          nodeSelector:
+            cloud.google.com/gke-tpu-accelerator: tpu7x
+            cloud.google.com/gke-tpu-topology: 2x2x4
