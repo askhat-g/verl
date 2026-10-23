@@ -141,12 +141,14 @@ def get_ppo_ray_runtime_env(config=None):
     for key in ("VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT", "VERL_RL_INSIGHT_ENABLE"):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")
     # Forward only when set: empty string breaks vLLM ParallelConfig int parsing.
+    # VERL_TPU_SEQ_BUCKET_SIZE is read by the TorchTitan TPU engine on the trainer workers (packed-length bucket).
     for key in (
         "PYTHONHASHSEED",
         "CUBLAS_WORKSPACE_CONFIG",
         "FLASH_ATTENTION_DETERMINISTIC",
         "NCCL_DETERMINISTIC",
         "NCCL_ALGO",
+        "VERL_TPU_SEQ_BUCKET_SIZE",
     ):
         val = os.environ.get(key)
         if val is not None:

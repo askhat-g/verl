@@ -400,8 +400,11 @@ def rearrange_micro_batches(
         # used to support pp
         num_micro_batches = max(min_num_micro_batch, num_micro_batches)
     sync_micro_batch_count = dist.is_initialized() and same_micro_num_in_dp and dp_group is not None
+    # TPU: run these small integer MAX/MIN all-reduces on CPU (as compute_global_batch_num_tokens does); XLA on TPU only
+    # lowers Sum all-reduces for this program ("supported lowering only of Sum all reduce").
+    collective_device = "cpu" if get_device_name() == "tpu" else get_device_name()
     if sync_micro_batch_count:
-        num_micro_batches = torch.tensor([num_micro_batches], device=get_device_name())
+        num_micro_batches = torch.tensor([num_micro_batches], device=collective_device)
         dist.all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
         num_micro_batches = num_micro_batches.cpu().item()
     if num_batches_divided_by is not None:
@@ -427,7 +430,7 @@ def rearrange_micro_batches(
     min_num_groups = num_groups
     if sync_micro_batch_count:
         # Fatal constraints must be agreed on before any rank raises; otherwise peers can hang in the next collective.
-        constraints = torch.tensor([max_group_token_len, -num_groups], dtype=torch.long, device=get_device_name())
+        constraints = torch.tensor([max_group_token_len, -num_groups], dtype=torch.long, device=collective_device)
         dist.all_reduce(constraints, op=dist.ReduceOp.MAX, group=dp_group)
         max_group_token_len = int(constraints[0].item())
         min_num_groups = -int(constraints[1].item())
@@ -454,7 +457,7 @@ def rearrange_micro_batches(
             sum(group_token_lens[idx] for idx in partition) <= max_token_len for partition in micro_bsz_group_idx
         )
         if sync_micro_batch_count:
-            within_limit_tensor = torch.tensor([int(within_limit)], device=get_device_name())
+            within_limit_tensor = torch.tensor([int(within_limit)], device=collective_device)
             dist.all_reduce(within_limit_tensor, op=dist.ReduceOp.MIN, group=dp_group)
             within_limit = bool(within_limit_tensor.item())
         if within_limit:

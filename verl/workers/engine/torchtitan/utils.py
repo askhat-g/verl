@@ -230,6 +230,12 @@ def configure_qwen3_moe_for_rl(
                 f"are only guaranteed to be multiples of {token_multiple} (top_k={moe.router.top_k}). Set "
                 f"VERL_TPU_SEQ_BUCKET_SIZE so that it times top_k is a multiple of {tile_m} (the default 256 is)."
             )
+    # TPU token dispatcher (custom VJPs): the default one's scatter backward is ~5x slower per MoE layer on v5p.
+    from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher, TpuTokenDispatcherConverter
+
+    model_config = TpuTokenDispatcherConverter.Config().build().convert(model_config)
+    n_tpu_dispatchers = len(list(model_config.traverse(TpuAllToAllTokenDispatcher.Config)))
+    logger.warning("MoE: TPU token dispatcher on %d layers", n_tpu_dispatchers)
     model_config = TpuGroupedExpertsConverter.Config().build().convert(model_config)
     n_experts = 0
     for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):

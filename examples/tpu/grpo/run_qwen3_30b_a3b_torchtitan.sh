@@ -64,8 +64,15 @@ TPU_EAGER_MODE="${TPU_EAGER_MODE:-DEFER_AND_FUSE}"
 # KL-to-reference loss, off by default: the reference model keeps a second fp32 copy of the weights
 # (~3.8 GiB per device at 30B on 32 devices) and doubles the trainer's checkpoint load time.
 USE_KL_LOSS="${USE_KL_LOSS:-False}"
-# Per-micro-batch token budget for training and log-prob passes. Must stay >= MAX_MODEL_LEN.
-MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-2048}"
+# Pack sequences into micro-batches of up to MAX_TOKEN_LEN_PER_GPU tokens (use_dynamic_bsz) for training and log-prob
+# passes. Must stay >= MAX_MODEL_LEN. Each micro-batch has a large fixed cost on TPU (FSDP collectives), so a few
+# packed micro-batches are much faster than one sequence per micro-batch (v5p 2x2x4, 48 layers: update_actor
+# 54 s -> 8 s per step).
+USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
+MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-4096}"
+# Packed micro-batch lengths are padded to a multiple of this; a coarse bucket keeps the set of compiled shapes small
+# (with 256, almost every step hit a new length and recompiled for ~40 s).
+export VERL_TPU_SEQ_BUCKET_SIZE="${VERL_TPU_SEQ_BUCKET_SIZE:-1024}"
 # FSDP2 reshard policy (ignored with USE_SIMPLE_FSDP=True).
 RESHARD_AFTER_FORWARD="${RESHARD_AFTER_FORWARD:-always}"
 TEST_FREQ="${TEST_FREQ:-10}"
@@ -157,11 +164,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.use_dynamic_bsz="${USE_DYNAMIC_BSZ}" \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_GPU}" \
     actor_rollout_ref.actor.use_kl_loss="${USE_KL_LOSS}" \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz="${USE_DYNAMIC_BSZ}" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_GPU}" \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.torchtitan.tensor_parallel_size="${TENSOR_PARALLEL_SIZE}" \
@@ -182,6 +191,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.dtype=bfloat16 \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz="${USE_DYNAMIC_BSZ}" \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_GPU}" \
     actor_rollout_ref.rollout.checkpoint_engine.backend="${CHECKPOINT_BACKEND}" \
     +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.release_buffers_after_sync="${RELEASE_SYNC_BUFFERS}" \
