@@ -201,3 +201,114 @@ def test_barrier_times_out_instead_of_hanging(monkeypatch):
         assert server.engine.pause_calls == 1, "barrier must proceed rather than deadlock"
 
     asyncio.run(main())
+
+
+class _QueuedEngine(_FakeEngine):
+    """Engine whose requests land in the (fake) scheduler but are never scheduled.
+
+    Models a request stuck in vLLM's WAITING queue because the batch is larger than
+    max_num_seqs: add_request() returns immediately, but no output is ever produced
+    until pause_generation(abort) finishes the request.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.queues: dict[str, asyncio.Queue] = {}
+        self.aborted: list[str] = []
+
+    async def add_request(self, request_id, prompt, params, **kwargs):
+        q = asyncio.Queue()
+        self.queues[request_id] = q
+        self.output_processor.request_states[request_id] = object()
+
+        class _Collector:
+            def get_nowait(self_inner):
+                try:
+                    return q.get_nowait()
+                except asyncio.QueueEmpty:
+                    return None
+
+            async def get(self_inner):
+                return await q.get()
+
+        return _Collector()
+
+    async def pause_generation(self, **kwargs):
+        await super().pause_generation(**kwargs)
+        # abort mode: every in-flight request finishes with an empty output.
+        for rid, q in self.queues.items():
+            self.aborted.append(rid)
+            q.put_nowait(SimpleNamespace(finished=True, outputs=[]))
+        self.output_processor.request_states.clear()
+
+    async def abort(self, request_id):
+        self.aborted.append(request_id)
+
+
+def _make_queued_server():
+    server = _make_server()
+    server.engine = _QueuedEngine()
+    server.engine.server = server
+    return server
+
+
+def test_abort_is_not_blocked_by_requests_waiting_for_their_first_token():
+    # Regression: the barrier used to be released on the first *token*, so requests parked
+    # in the scheduler's WAITING queue held _admitting > 0 and abort_all_requests() could
+    # not pause the engine until every one of them had been scheduled and prefilled.
+    async def main():
+        server = _make_queued_server()
+
+        async def submit(rid):
+            assert await server._park_until_admitted(rid) is None
+            return await server._generate_admitted(
+                prompt={"prompt_token_ids": [1]},
+                sampling_params=SimpleNamespace(),
+                request_id=rid,
+                lora_request=None,
+                priority=0,
+            )
+
+        tasks = [asyncio.create_task(submit(f"r{i}")) for i in range(8)]
+        await asyncio.sleep(0.05)
+
+        assert server._admitting == 0, "barrier must be released once add_request returns"
+        assert len(server.engine.queues) == 8, "all requests reached the engine"
+        assert not any(t.done() for t in tasks), "requests are still waiting for tokens"
+
+        await asyncio.wait_for(server.abort_all_requests(), timeout=1)
+
+        assert server.engine.pause_calls == 1
+        assert server.engine.admitting_at_pause == 0
+        results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+        assert all(r.finished and r.outputs == [] for r in results), "aborted requests return empty"
+        assert sorted(server.engine.aborted) == sorted(f"r{i}" for i in range(8))
+        assert server._admitting == 0
+
+    asyncio.run(main())
+
+
+def test_cancelled_request_releases_barrier_and_aborts_in_engine():
+    async def main():
+        server = _make_queued_server()
+        assert await server._park_until_admitted("r1") is None
+        task = asyncio.create_task(
+            server._generate_admitted(
+                prompt={"prompt_token_ids": [1]},
+                sampling_params=SimpleNamespace(),
+                request_id="r1",
+                lora_request=None,
+                priority=0,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert server._admitting == 0
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert server.engine.aborted == ["r1"], "cancellation must drop the request from the engine"
+        assert server._admitting == 0
+
+    asyncio.run(main())
