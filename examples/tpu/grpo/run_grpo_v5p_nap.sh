@@ -112,6 +112,9 @@ fi
 PREWARM_MODEL_PATH="${PREWARM_MODEL_PATH:-${DEFAULT_PREWARM_PATH}}"
 SMOKE_TEST="${SMOKE_TEST:-0}"
 VERIFY_LOG="${VERIFY_LOG:-1}"
+# Raiden weight-sync verification passed to JOB_SCRIPT (RaidenParityCheck): all = step-0 bit-exact check plus a
+# per-step norm check; a mismatch fails the job. VERIFY_LOG=1 (verify_tpu_e2e_log.py grpo) requires both checks.
+VERIFY_PARITY="${VERIFY_PARITY:-all}"
 KEEP_CLUSTER="${KEEP_CLUSTER:-0}"
 LOCAL_PORT="${LOCAL_PORT:-$((18265 + RANDOM % 1000))}"
 CLUSTER_READY_TIMEOUT="${CLUSTER_READY_TIMEOUT:-1200}"
@@ -448,6 +451,7 @@ env_vars = {
     "N_CHIPS_TRAINER": "${N_CHIPS_TRAINER}",
     "NNODES_ROLLOUT": "${NNODES_ROLLOUT}",
     "N_CHIPS_ROLLOUT": "${N_CHIPS_ROLLOUT}",
+    "VERIFY_PARITY": "${VERIFY_PARITY}",
 }
 for k, v in {
     "ROLLOUT_TP": "${ROLLOUT_TP:-}",

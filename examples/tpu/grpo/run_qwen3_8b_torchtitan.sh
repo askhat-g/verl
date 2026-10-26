@@ -37,6 +37,10 @@ TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-3}"
 # of local shards plus ~1.7 GiB of full q/k/v, which torchtitan's fused-wqkv save hook still all-gathers.
 # This is the engine default; set False to keep and rebind them instead (faster init, more HBM).
 RELEASE_SYNC_BUFFERS="${RELEASE_SYNC_BUFFERS:-True}"
+# Raiden weight-sync verification (RaidenParityCheck): off | norm (per-step L1/L2) | exact (step-0 bit-for-bit
+# compare with the checkpoint vLLM loaded) | all. A failed check raises RaidenParityError and stops the run.
+# run_grpo_v5p_nap.sh sets VERIFY_PARITY=all.
+VERIFY_PARITY="${VERIFY_PARITY:-off}"
 # Full AC, as in torchtitan's qwen3-8b v6e-8 recipe (selective AC OOMs on v6e).
 ACTIVATION_CHECKPOINT="${ACTIVATION_CHECKPOINT:-full}"
 # SimpleFSDP: the FSDP all-gather/reduce-scatter are traced into each compiled TransformerBlock instead of running
@@ -177,6 +181,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_GPU}" \
     actor_rollout_ref.rollout.checkpoint_engine.backend=raiden \
     +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.release_buffers_after_sync="${RELEASE_SYNC_BUFFERS}" \
+    +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.verify_parity="${VERIFY_PARITY}" \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \

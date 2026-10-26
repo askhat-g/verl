@@ -71,6 +71,11 @@ else
     VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 fi
 
+# Raiden weight-sync verification (RaidenParityCheck): off | norm (per-step L1/L2) | exact (step-0 bit-for-bit
+# compare with the checkpoint vLLM loaded) | all. A failed check raises RaidenParityError and stops the run.
+# True = norm. TPU CI sets VERIFY_PARITY=all.
+VERIFY_PARITY="${VERIFY_PARITY:-True}"
+
 # Project details
 project_name='verl_tpu_grpo'
 
@@ -204,7 +209,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.rollout.checkpoint_engine.backend=raiden \
-    +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.verify_parity=True \
+    +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.verify_parity="${VERIFY_PARITY}" \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \

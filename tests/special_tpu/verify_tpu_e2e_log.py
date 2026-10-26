@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Verify the Ray job log of a TPU CI test (smoke: TPU platform / sft: trainer / grpo: RL).
+"""Verify the Ray job log of a TPU CI test (smoke: TPU platform / sft: trainer / grpo: RL, including the Raiden
+weight-sync parity checks / raiden_sync: tests/special_tpu/raiden_sync_test.py).
 
 Usage:
-    python3 tests/special_tpu/verify_tpu_e2e_log.py <smoke|sft|grpo> <log_file> <smoke_test: 0|1>
+    python3 tests/special_tpu/verify_tpu_e2e_log.py <smoke|sft|grpo|raiden_sync> <log_file> <smoke_test: 0|1>
 """
 
 import math
@@ -53,6 +54,30 @@ def verify_sft(text: str, smoke_test: bool) -> None:
     )
 
 
+def verify_raiden(text: str) -> None:
+    """Check that the Raiden weight sync ran with VERIFY_PARITY=all and that both parity checks passed.
+
+    The engine already raises RaidenParityError on a mismatch (failing the job). This makes sure the checks actually
+    ran: a config or logging change that silently turned them off would otherwise pass CI.
+    """
+    if "RAIDEN PARITY MISMATCH" in text or "RaidenParityError" in text:
+        sys.exit("[TPU CI] ERROR: Raiden parity check failed (see RAIDEN PARITY lines in the log).")
+    synced_steps = {int(s) for s in re.findall(r"\[RAIDEN TELEMETRY \| Orchestrator\] Step (\d+) Completed", text)}
+    if 0 not in synced_steps:
+        sys.exit("[TPU CI] ERROR: No Raiden step-0 weight sync ([RAIDEN TELEMETRY | Orchestrator] Step 0) in the log.")
+    if not re.search(r"\[RAIDEN PARITY EXACT \| Step 0\] .* 0 mismatched, 0 unresolved", text):
+        sys.exit("[TPU CI] ERROR: Raiden step-0 exact parity check did not run or did not report 0 mismatched.")
+    verified_steps = {int(s) for s in re.findall(r"\[RAIDEN PARITY VERIFIED \| Step (\d+)", text)}
+    unverified = sorted(synced_steps - {0} - verified_steps)
+    if unverified:
+        sys.exit(f"[TPU CI] ERROR: Raiden syncs at steps {unverified} have no RAIDEN PARITY VERIFIED norm check.")
+    if not re.search(r"timing_s/tpu-sync/total_sync[:\s]+[0-9.eE+-]+", text):
+        sys.exit("[TPU CI] ERROR: Missing timing_s/tpu-sync/total_sync metric in GRPO output.")
+    print(
+        f"[TPU CI] Raiden weight sync verified: exact parity at step 0, norm parity at steps {sorted(verified_steps)}"
+    )
+
+
 def verify_grpo(text: str, smoke_test: bool) -> None:
     if re.search(r"actor/grad_norm[:\s]+(nan|inf)", text, flags=re.IGNORECASE):
         sys.exit("[TPU CI] ERROR: Non-finite actor/grad_norm detected in GRPO output!")
@@ -88,9 +113,20 @@ def verify_grpo(text: str, smoke_test: bool) -> None:
         f"val_acc={val_accs[-1] if val_accs else 'N/A'}, min_corr={min(corrs) if corrs else 'N/A'}, "
         f"max_grad_norm={max(grad_norms):.4f}"
     )
+    verify_raiden(text)
 
 
-VERIFIERS = {"smoke": verify_smoke, "sft": verify_sft, "grpo": verify_grpo}
+def verify_raiden_sync(text: str, smoke_test: bool) -> None:
+    """tests/special_tpu/raiden_sync_test.py: every case and sync bit-exact (the script exits non-zero otherwise)."""
+    if "[raiden test] PASSED" not in text:
+        sys.exit("[TPU CI] ERROR: Raiden sync test did not report PASSED.")
+    exact_syncs = len(re.findall(r"\[raiden test\] .* step \d+: bit-exact", text))
+    if exact_syncs == 0:
+        sys.exit("[TPU CI] ERROR: Raiden sync test logged no bit-exact sync.")
+    print(f"[TPU CI] Raiden sync test verified: {exact_syncs} bit-exact syncs.")
+
+
+VERIFIERS = {"smoke": verify_smoke, "sft": verify_sft, "grpo": verify_grpo, "raiden_sync": verify_raiden_sync}
 
 
 def main() -> None:

@@ -410,14 +410,23 @@ test_trainer_sft() {
         bash examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh
 }
 
+test_raiden_sync() {
+    # Raiden weight sync without vLLM: forward-only TorchTitan trainer on one slice -> RaidenController /
+    # tpu-sync -> fake single-chip samplers on the other slice; every received tensor is compared bit for bit
+    # with its TP slice of the checkpoint (1xTP4, 2xTP2, keep-buffers; 3 syncs each).
+    submit_and_verify_ray_job raiden_sync 20 '{}' python3 tests/special_tpu/raiden_sync_test.py
+}
+
 test_rl_grpo() {
     # Qwen3-0.6B GSM8K GRPO: 4-chip TorchTitan trainer on tpu-group-0 + 4-chip vLLM rollout on
     # tpu-group-1 (see TPUPlatform.auto_assign_accelerator_type).
     # Disable Qwen3 <think>: with thinking on, 512-token smoke rollouts are all clipped before
     # "#### <answer>" and the reward is ~0. 8 prompts x 4 samples per step keeps the
     # training-reward check stable.
+    # VERIFY_PARITY=all: Raiden weight sync is checked bit for bit at step 0 and by per-tensor norms at every later
+    # step; a mismatch raises RaidenParityError and fails the job (see RaidenParityCheck).
     submit_and_verify_ray_job grpo 40 \
-        '{"NNODES_TRAINER": "1", "N_CHIPS_TRAINER": "4", "NNODES_ROLLOUT": "1", "N_CHIPS_ROLLOUT": "4"}' \
+        '{"NNODES_TRAINER": "1", "N_CHIPS_TRAINER": "4", "NNODES_ROLLOUT": "1", "N_CHIPS_ROLLOUT": "4", "VERIFY_PARITY": "all"}' \
         bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh \
         +data.apply_chat_template_kwargs.enable_thinking=False \
         trainer.val_before_train=True \
@@ -453,6 +462,7 @@ run_tier() {
             provision_ray_cluster "${tier}" v6e-4 2 4 16Gi 96 400Gi
             wait_for_ray_cluster
             connect_ray_dashboard
+            test_raiden_sync
             test_rl_grpo
             ;;
         *)
