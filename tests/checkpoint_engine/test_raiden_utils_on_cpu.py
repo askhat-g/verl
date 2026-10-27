@@ -423,7 +423,10 @@ async def test_update_raiden_weights_single_transfer_over_all_replicas(stub_tpu_
         assert replica.server_handle.global_steps == 5
 
     names = [e[0] for e in manager.events]
-    assert names == ["abort", "update_weights", "release", "resume"]
+    # The samplers are quiesced concurrently with the trainer-side export, so abort and update_weights may
+    # come in either order; both precede the transfer (release is requested right after it) and the resume.
+    assert sorted(names[:2]) == ["abort", "update_weights"]
+    assert names[2:] == ["release", "resume"]
     assert {
         "timing_s/tpu-sync/quiesce",
         "timing_s/tpu-sync/trainer_init",
