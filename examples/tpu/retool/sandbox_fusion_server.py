@@ -1,0 +1,234 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Loopback SandboxFusion-compatible HTTP server (/run_code) for ReTool multi-turn code execution."""
+
+import argparse
+import asyncio
+import json
+import os
+import resource
+import signal
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Optional
+
+import uvicorn
+from fastapi import FastAPI, Request, Response
+from pydantic import BaseModel, Field
+
+# NOTE / TODO(security): This server executes model-generated Python snippets inside an isolated GKE TPU
+# training pod and binds strictly to loopback (127.0.0.1) so it is unreachable outside the local pod.
+# For multi-tenant or external network exposure, add bearer-token authentication and container/nsjail isolation.
+app = FastAPI(title="SandboxFusion Local Server", docs_url=None, redoc_url=None, openapi_url=None)
+
+ALLOWED_LANGUAGES = frozenset({"python", "python3"})
+MAX_CONCURRENT_PROCESSES = int(os.environ.get("SANDBOX_MAX_CONCURRENCY", "64"))
+_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+@app.middleware("http")
+async def _security_headers_middleware(request: Request, call_next) -> Response:
+    if request.method not in ("GET", "POST"):
+        return Response(status_code=405, content="Method Not Allowed")
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    global _SEMAPHORE
+    if _SEMAPHORE is None:
+        _SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_PROCESSES)
+    return _SEMAPHORE
+
+
+class RunCodeRequest(BaseModel):
+    """Request schema matching SandboxFusion's /run_code endpoint."""
+
+    compile_timeout: float = 10.0
+    run_timeout: float = 30.0
+    code: str = Field(default="", max_length=262144)
+    stdin: Optional[str] = Field(default="", max_length=262144)
+    memory_limit_MB: int = 1024
+    language: str = "python"
+    files: dict[str, Any] = Field(default_factory=dict)
+    fetch_files: list[str] = Field(default_factory=list)
+
+
+def _make_preexec_fn(memory_limit_mb: int):
+    def _preexec():
+        os.setsid()
+        if memory_limit_mb and memory_limit_mb > 0:
+            # Allow virtual address space headroom for OpenBLAS/NumPy/SymPy shared libraries.
+            limit_bytes = max(memory_limit_mb, 4096) * 1024 * 1024
+            try:
+                resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+            except (ValueError, OSError):
+                pass
+
+    return _preexec
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    """Return loopback server health status."""
+    return {"status": "ok"}
+
+
+@app.post("/run_code")
+async def run_code(req: RunCodeRequest) -> dict[str, Any]:
+    """Execute a Python snippet inside an ephemeral temporary directory with timeout and RLIMIT_AS caps."""
+    if req.language not in ALLOWED_LANGUAGES:
+        return {
+            "status": "SandboxError",
+            "message": f"Unsupported language: {req.language}",
+            "compile_result": None,
+            "run_result": None,
+        }
+
+    timeout = max(1.0, min(float(req.run_timeout or 30.0), 120.0))
+    stdin_bytes = (req.stdin or "").encode("utf-8")
+
+    async with _get_semaphore():
+        with tempfile.TemporaryDirectory(prefix="sandbox_exec_") as tmp_dir:
+            script_path = os.path.join(tmp_dir, "solution.py")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(req.code)
+
+            env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": tmp_dir,
+                "TMPDIR": tmp_dir,
+                "PYTHONIOENCODING": "utf-8",
+                "OPENBLAS_NUM_THREADS": "1",
+                "OMP_NUM_THREADS": "1",
+                "MKL_NUM_THREADS": "1",
+            }
+            if "PYTHONPATH" in os.environ:
+                env["PYTHONPATH"] = os.environ["PYTHONPATH"]
+
+            start_t = time.monotonic()
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-u",
+                script_path,
+                stdin=asyncio.subprocess.PIPE if stdin_bytes else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=tmp_dir,
+                env=env,
+                preexec_fn=_make_preexec_fn(req.memory_limit_MB),
+            )
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(input=stdin_bytes if stdin_bytes else None),
+                    timeout=timeout,
+                )
+                elapsed = time.monotonic() - start_t
+                stdout_str = stdout_bytes.decode("utf-8", errors="replace")
+                stderr_str = stderr_bytes.decode("utf-8", errors="replace")
+                return_code = proc.returncode if proc.returncode is not None else 0
+                return {
+                    "status": "Success" if return_code == 0 else "Failed",
+                    "message": "",
+                    "compile_result": None,
+                    "run_result": {
+                        "status": "Finished",
+                        "execution_time": elapsed,
+                        "return_code": return_code,
+                        "stdout": stdout_str,
+                        "stderr": stderr_str,
+                    },
+                }
+            except asyncio.TimeoutError:
+                elapsed = time.monotonic() - start_t
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+                await proc.wait()
+                return {
+                    "status": "Failed",
+                    "message": "TimeLimitExceeded",
+                    "compile_result": None,
+                    "run_result": {
+                        "status": "TimeLimitExceeded",
+                        "execution_time": elapsed,
+                        "return_code": -9,
+                        "stdout": "",
+                        "stderr": f"TimeoutError: execution exceeded {timeout}s\n",
+                    },
+                }
+            except (RuntimeError, OSError) as exc:
+                elapsed = time.monotonic() - start_t
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except OSError:
+                    pass
+                return {
+                    "status": "Failed",
+                    "message": "ExecutionError",
+                    "compile_result": None,
+                    "run_result": {
+                        "status": "Error",
+                        "execution_time": elapsed,
+                        "return_code": -1,
+                        "stdout": "",
+                        "stderr": f"{type(exc).__name__}\n",
+                    },
+                }
+
+
+def check_server(host: str = "127.0.0.1", port: int = 18080) -> bool:
+    """Verify the local SandboxFusion HTTP server responds cleanly to a smoke-test evaluation."""
+    url = f"http://{host}:{port}/run_code"
+    payload = json.dumps({"code": "print(6*7)", "run_timeout": 5}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            print(json.dumps(body))
+            return resp.status == 200 and body.get("status") == "Success"
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def main() -> None:
+    """CLI entry point for starting or probing the loopback SandboxFusion server."""
+    parser = argparse.ArgumentParser(description="SandboxFusion-compatible loopback HTTP server")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--check", action="store_true", help="Check if local server is healthy and exit")
+    args = parser.parse_args()
+    if args.check:
+        sys.exit(0 if check_server(args.host, args.port) else 1)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    verl_root = os.path.abspath(os.path.join(script_dir, "..", "..", ".."))
+    existing_py_path = os.environ.get("PYTHONPATH", "")
+    if verl_root not in existing_py_path.split(os.pathsep):
+        os.environ["PYTHONPATH"] = f"{verl_root}{os.pathsep}{existing_py_path}" if existing_py_path else verl_root
+    target: Any = "examples.tpu.retool.sandbox_fusion_server:app" if args.workers > 1 else app
+    uvicorn.run(target, host=args.host, port=args.port, workers=args.workers, app_dir=verl_root, log_level="warning")
+
+
+if __name__ == "__main__":
+    main()

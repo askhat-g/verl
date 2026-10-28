@@ -16,14 +16,17 @@ The concrete Engine implementation using PyTorch TorchTitan parallelism (FSDP2 +
 """
 
 import importlib
+import json
 import logging
 import os
 import re
+import shutil
 from contextlib import nullcontext
 from typing import Any, Callable, Optional
 
 import torch
 import torch.distributed
+from safetensors.torch import save_file as save_safetensors_file
 from tensordict import TensorDict
 from torch.distributed.tensor import DTensor
 from torchtitan.components.checkpoint import CheckpointManager
@@ -657,24 +660,178 @@ class TorchTitanEngine(BaseEngine):
         max_ckpt_to_keep: Optional[int] = None,
         **kwargs,
     ) -> None:
-        """Save checkpoint."""
+        """Save TorchTitan distributed and/or HuggingFace safetensors checkpoint according to ``save_contents``."""
         if self._is_offload_param:
             for module in self.module:
                 load_fsdp_model_to_gpu(module)
 
-        # Override TorchTitan's folder to use verl's path
-        parent_dir = os.path.dirname(local_path)
-        self.checkpointer.folder = parent_dir
+        save_contents = (
+            list(self.checkpoint_config.save_contents)
+            if self.checkpoint_config is not None and self.checkpoint_config.save_contents is not None
+            else ["model", "optimizer", "extra"]
+        )
 
-        if max_ckpt_to_keep is not None:
-            self.checkpointer.keep_latest_k = max_ckpt_to_keep
+        if any(k in save_contents for k in ("model", "optimizer")):
+            # Override TorchTitan's folder to use verl's path
+            parent_dir = os.path.dirname(local_path)
+            self.checkpointer.folder = parent_dir
 
-        self.checkpointer.save(curr_step=global_step)
+            if max_ckpt_to_keep is not None:
+                self.checkpointer.keep_latest_k = max_ckpt_to_keep
+
+            self.checkpointer.save(curr_step=global_step)
+
+        if "hf_model" in save_contents:
+            self._save_hf_checkpoint(local_path)
 
         torch.distributed.barrier()
         if self._is_offload_param:
             for module in self.module:
                 offload_fsdp_model_to_cpu(module)
+
+    def _save_hf_checkpoint(self, local_path: str) -> None:
+        """Export HuggingFace safetensors + config/tokenizer into ``<local_path>/huggingface``.
+
+        Gathers 3D MoE expert stacks in bulk (e.g. 144 stacks on Qwen3-30B-A3B instead of 18,432 per-expert syncs),
+        restricts CPU materialization to one writer per host, and flushes each completed safetensors shard
+        immediately so peak host RAM stays bounded to ~1 shard rather than the full model.
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        ray_local_ws = int(os.environ.get("RAY_LOCAL_WORLD_SIZE", "0"))
+        tpu_visible_chip = os.environ.get("TPU_VISIBLE_CHIPS", "")
+        if tpu_visible_chip.isdigit():
+            local_rank = int(tpu_visible_chip)
+        elif ray_local_ws > 0:
+            local_rank = rank % ray_local_ws
+        else:
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        should_write = rank == 0 or (local_rank == 0 and local_path.startswith(("/dev/shm", "/tmp")))
+
+        params: dict[str, Any] = {}
+        for module in self.module:
+            params.update(module.state_dict())
+
+        stacks: dict[str, list[tuple[str, tuple]]] = {}
+        for name, param in params.items():
+            slots = self._expert_stack_slots(name, param)
+            if slots is not None:
+                stacks[name] = slots
+        expert_stacks = [(params[name], slots) for name, slots in stacks.items()]
+        dense = self._to_hf_named_params({k: v for k, v in params.items() if k not in stacks})
+        params.clear()
+
+        hf_config = getattr(self.model_config, "hf_config", None)
+        all_hf_keys = set(dense.keys()) | {hf_name for _stack, slots in expert_stacks for hf_name, _shape in slots}
+        if getattr(hf_config, "tie_word_embeddings", False) and "model.embed_tokens.weight" in all_hf_keys:
+            all_hf_keys.discard("lm_head.weight")
+
+        hf_local_path = os.path.join(local_path, "huggingface")
+        src_dir = getattr(self.model_config, "path", None)
+        index_data: Optional[dict[str, Any]] = None
+        new_weight_map: dict[str, str] = {}
+        remaining_in_shard: dict[str, int] = {}
+        pending_shards: dict[str, dict[str, torch.Tensor]] = {}
+        single_state_dict: dict[str, torch.Tensor] = {}
+
+        if should_write:
+            os.makedirs(hf_local_path, exist_ok=True)
+            if src_dir and os.path.isdir(src_dir):
+                for fname in os.listdir(src_dir):
+                    src_file = os.path.join(src_dir, fname)
+                    if not os.path.isfile(src_file):
+                        continue
+                    if fname.endswith((".safetensors", ".bin", ".pt", ".pth", ".ckpt")) or fname in (
+                        "model.safetensors.index.json",
+                        "pytorch_model.bin.index.json",
+                    ):
+                        continue
+                    shutil.copy2(src_file, os.path.join(hf_local_path, fname))
+
+            if hf_config is not None and not os.path.isfile(os.path.join(hf_local_path, "config.json")):
+                hf_config.save_pretrained(hf_local_path)
+            tokenizer = getattr(self.model_config, "tokenizer", None)
+            if tokenizer is not None and not os.path.isfile(os.path.join(hf_local_path, "tokenizer_config.json")):
+                tokenizer.save_pretrained(hf_local_path)
+
+            index_file = os.path.join(src_dir, "model.safetensors.index.json") if src_dir else ""
+            if index_file and os.path.isfile(index_file):
+                with open(index_file, encoding="utf-8") as f:
+                    index_data = json.load(f)
+                weight_map = index_data.get("weight_map", {})
+                default_shard = next(iter(weight_map.values()), "model.safetensors")
+                for k in sorted(all_hf_keys):
+                    shard_name = weight_map.get(k, default_shard)
+                    new_weight_map[k] = shard_name
+                    remaining_in_shard[shard_name] = remaining_in_shard.get(shard_name, 0) + 1
+
+        def _record_cpu_tensor(hf_name: str, cpu_tensor: torch.Tensor) -> None:
+            if hf_name not in all_hf_keys:
+                return
+            if index_data is not None:
+                shard_name = new_weight_map[hf_name]
+                pending_shards.setdefault(shard_name, {})[hf_name] = cpu_tensor
+                remaining_in_shard[shard_name] -= 1
+                if remaining_in_shard[shard_name] == 0:
+                    save_safetensors_file(
+                        pending_shards.pop(shard_name),
+                        os.path.join(hf_local_path, shard_name),
+                        metadata={"format": "pt"},
+                    )
+            else:
+                single_state_dict[hf_name] = cpu_tensor
+
+        device = get_device_id()
+        is_tpu = get_device_name() == "tpu"
+
+        for name, param in dense.items():
+            if isinstance(param, DTensor):
+                full = param.to(device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
+            else:
+                full = param.to(torch.bfloat16, non_blocking=True)
+            if should_write and name in all_hf_keys:
+                _record_cpu_tensor(name, full.detach().cpu().contiguous())
+            elif is_tpu:
+                get_platform().synchronize()
+            del full
+        dense.clear()
+
+        for stack, slots in expert_stacks:
+            full = stack.to(device, non_blocking=True)
+            if isinstance(full, DTensor):
+                full = full.full_tensor()
+            full = full.to(torch.bfloat16, non_blocking=True)
+            if should_write:
+                full_cpu = full.detach().cpu().contiguous()
+                for e, (hf_name, _shape) in enumerate(slots):
+                    if hf_name in all_hf_keys:
+                        _record_cpu_tensor(hf_name, full_cpu[e].clone())
+                del full_cpu
+            elif is_tpu:
+                get_platform().synchronize()
+            del full
+        expert_stacks.clear()
+
+        if should_write:
+            if index_data is not None:
+                for shard_name, shard_tensors in list(pending_shards.items()):
+                    save_safetensors_file(
+                        shard_tensors,
+                        os.path.join(hf_local_path, shard_name),
+                        metadata={"format": "pt"},
+                    )
+                pending_shards.clear()
+                index_data["weight_map"] = new_weight_map
+                with open(os.path.join(hf_local_path, "model.safetensors.index.json"), "w", encoding="utf-8") as f:
+                    json.dump(index_data, f, indent=2)
+            else:
+                save_safetensors_file(
+                    single_state_dict,
+                    os.path.join(hf_local_path, "model.safetensors"),
+                    metadata={"format": "pt"},
+                )
+                single_state_dict.clear()
+
+            logger.warning("Saved HuggingFace checkpoint to %s", hf_local_path)
 
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
