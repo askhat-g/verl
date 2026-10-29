@@ -129,7 +129,7 @@ class QATEngineConfig(BaseConfig):
 
     Args:
         enable (bool): Whether to enable QAT, default False
-        mode (str): Quantization mode, "w4a16" or "w4a4", default "w4a16"
+        mode (str): Quantization mode, "fp8", "mxfp8", "mxfp4", or "nvfp4", default "fp8"
         group_size (int): Group size for blockwise quantization, default 16
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
@@ -137,7 +137,7 @@ class QATEngineConfig(BaseConfig):
     """
 
     enable: bool = False
-    mode: str = "w4a16"
+    mode: str = "fp8"
     group_size: int = 16
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
@@ -179,7 +179,9 @@ class McoreEngineConfig(EngineConfig):
     """
 
     # sequence_parallel is not listed as a frozen field for auto-correction purpose
-    _mutable_fields = EngineConfig._mutable_fields | {"sequence_parallel"}
+    _mutable_fields = EngineConfig._mutable_fields | {"sequence_parallel", "_liger_flsce_capacity"}
+    # Runtime-only reservation shared by colocated engines, not a user-facing knob.
+    _liger_flsce_capacity: Optional[tuple[int, int]] = field(default=None, init=False, repr=False)
     # mcore parallelism
     tensor_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
@@ -318,6 +320,11 @@ class VeOmniEngineConfig(EngineConfig):
         enable_full_shard (bool): Enable fully shard for FSDP training (ZeRO-3), default False
         enable_fsdp_offload (bool): Enable CPU offload for FSDP1, default False
         enable_reentrant (bool): Use reentrant gradient checkpointing, default False
+        broadcast_model_weights_from_rank0 (bool): Rank 0 reads the checkpoint and broadcasts
+            every tensor; False makes every rank read it instead, which avoids pushing the whole
+            model through a slow inter-node network. Default True
+        ep_sharded_stream_load (bool): With broadcast_model_weights_from_rank0=False, each rank
+            reads only its own slice of expert-parallel tensors, default False
         attn_implementation (str): Attention implementation to use.
             1. `eager`
             2. `sdpa`
@@ -368,6 +375,9 @@ class VeOmniEngineConfig(EngineConfig):
             in distributed training. Important: this will negatively impact performance, so only use it for
             debugging.
         mixed_precision (Optional[dict[str, Any]]): Mixed precision configuration for FSDP, default None
+        low_precision_reduce_scatter_comm (bool): Use VeOmni's node-local BF16 ReduceScatter
+            transport while retaining FP32 accumulation and output. Requires mixed precision
+            and only affects backward gradient communication. Default False.
         pad_to_length (bool): Round every packed micro-batch up to a multiple of
             ``pad_to_length_bucket`` tokens, so the packed shape only takes a handful of distinct
             values instead of a new one per micro-batch, which avoids repeated kernel
@@ -416,12 +426,15 @@ class VeOmniEngineConfig(EngineConfig):
     seed: int = 42
     full_determinism: bool = False
     mixed_precision: bool = False
+    low_precision_reduce_scatter_comm: bool = False
     init_device: str = "meta"
     enable_full_shard: bool = False
     ckpt_manager: Literal["dcp"] = "dcp"
     load_checkpoint_path: Optional[str] = None
     enable_fsdp_offload: bool = False
     enable_reentrant: bool = False
+    broadcast_model_weights_from_rank0: bool = True
+    ep_sharded_stream_load: bool = False
     attn_implementation: str = "flash_attention_2"
     moe_implementation: str = "fused"
     # Kernel-backend selectors for VeOmni's per-model patches; passed into
