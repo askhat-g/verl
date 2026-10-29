@@ -8,6 +8,10 @@ tools:
       default_timeout: 8
       default_language: "python"
       memory_limit_mb: 1024
+      # Options for the shared Ray execution actor; its loopback SandboxFusion server runs on the same node.
+      # Pinned to the CPU head node so code execution never lands on TPU trainer/rollout hosts.
+      ray_actor_options:
+        resources: {"node:__internal_head__": 0.001}
       type: native
 
     tool_schema:

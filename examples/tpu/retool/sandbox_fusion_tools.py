@@ -163,16 +163,27 @@ def init_execution_pool(
     rate_limit: int = 10,
     mode: PoolMode = PoolMode.ThreadMode,
     local_port: Optional[int] = 18080,
+    ray_actor_options: Optional[dict[str, Any]] = None,
 ):
-    """Initialize a Ray-shared or in-process execution pool."""
+    """Initialize a Ray-shared or in-process execution pool.
+
+    ``ray_actor_options`` are forwarded to ``.options()`` of the shared execution actor, e.g.
+    ``{"resources": {"node:__internal_head__": 0.001}}`` to place it (and its loopback server) on the head node.
+    """
     if not ray.is_initialized():
         return _LocalExecutionPool(local_port=local_port)
     if mode == PoolMode.ThreadMode:
+        options = {
+            "name": "sandbox-execution-pool",
+            "get_if_exists": True,
+            "max_concurrency": num_workers,
+            **(ray_actor_options or {}),
+        }
         for attempt in range(5):
             try:
                 return (
                     ray.remote(ExecutionWorker)
-                    .options(name="sandbox-execution-pool", get_if_exists=True, max_concurrency=num_workers)
+                    .options(**options)
                     .remote(
                         enable_global_rate_limit=enable_global_rate_limit,
                         rate_limit=rate_limit,
@@ -210,15 +221,24 @@ class SandboxFusionTool(BaseTool):
         if env_port and parsed_url.hostname in ("127.0.0.1", "localhost"):
             parsed_url = parsed_url._replace(netloc=f"{parsed_url.hostname}:{int(env_port)}")
             self.sandbox_fusion_url = urllib.parse.urlunparse(parsed_url)
-        local_port = parsed_url.port if parsed_url.hostname in ("127.0.0.1", "localhost") else None
-        self.execution_pool = init_execution_pool(
-            num_workers=self.num_workers,
-            enable_global_rate_limit=self.enable_global_rate_limit,
-            rate_limit=self.rate_limit,
-            mode=PoolMode.ThreadMode,
-            local_port=local_port,
-        )
+        self.local_port = parsed_url.port if parsed_url.hostname in ("127.0.0.1", "localhost") else None
+        self.ray_actor_options = config.get("ray_actor_options")
+        self._execution_pool = None
         logger.info(f"Init SandboxFusionTool with config: {config}")
+
+    @property
+    def execution_pool(self):
+        """Execution pool, created on first use so that loading tool schemas (e.g. in the dataset) starts nothing."""
+        if self._execution_pool is None:
+            self._execution_pool = init_execution_pool(
+                num_workers=self.num_workers,
+                enable_global_rate_limit=self.enable_global_rate_limit,
+                rate_limit=self.rate_limit,
+                mode=PoolMode.ThreadMode,
+                local_port=self.local_port,
+                ray_actor_options=self.ray_actor_options,
+            )
+        return self._execution_pool
 
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
         """Return the tool schema in OpenAI function-calling format."""

@@ -45,17 +45,9 @@ for extra_py_dir in /torchtitan/torchtitan /torchtitan /app /torchtpu-vllm /torc
 done
 export PYTHONPATH=".:${VERL_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-# Ensure loopback-only SandboxFusion FastAPI code execution server is running on port 18080 (avoiding KubeRay's 8080).
-SANDBOX_FUSION_HOST="${SANDBOX_FUSION_HOST:-127.0.0.1}"
+# Loopback SandboxFusion port (avoiding KubeRay's 8080). The server is started by the sandbox execution actor on the
+# node it is placed on (ray_actor_options in sandbox_fusion_tool_config_tpu.yaml), not by this script.
 SANDBOX_FUSION_PORT="${SANDBOX_FUSION_PORT:-18080}"
-SANDBOX_FUSION_WORKERS="${SANDBOX_FUSION_WORKERS:-4}"
-if ! python3 "${SCRIPT_DIR}/sandbox_fusion_server.py" --host "${SANDBOX_FUSION_HOST}" --port "${SANDBOX_FUSION_PORT}" --check >/dev/null 2>&1; then
-    nohup python3 "${SCRIPT_DIR}/sandbox_fusion_server.py" \
-        --host "${SANDBOX_FUSION_HOST}" \
-        --port "${SANDBOX_FUSION_PORT}" \
-        --workers "${SANDBOX_FUSION_WORKERS}" > /tmp/sandbox_fusion_server.log 2>&1 &
-    sleep 2
-fi
 
 # ================= data/model/tool =================
 RAY_DATA_HOME="${RAY_DATA_HOME:-/data/jialei}"

@@ -38,7 +38,7 @@ bash examples/tpu/retool/run_qwen3_30b_a3b_sft_torchtitan.sh
 
 ### 3. Stage 2: Multi-Turn DAPO RL with Code Interpreter (`64` TPU Chips)
 
-Launch the default **`512`-rollouts/step (`8192` response length, `8` max turns, `400` steps)** schedule (which automatically stages the Stage 1 SFT checkpoint to `/tmp/models/multiturn-sft-qwen3-30b-a3b-tpu` across all TPU nodes and auto-starts the 4-worker loopback `sandbox_fusion_server.py` daemon on `127.0.0.1:18080` inside the `ExecutionWorker` pod):
+Launch the default **`512`-rollouts/step (`8192` response length, `8` max turns, `400` steps)** schedule (which automatically stages the Stage 1 SFT checkpoint to `/tmp/models/multiturn-sft-qwen3-30b-a3b-tpu` across all TPU nodes and auto-starts the 4-worker loopback `sandbox_fusion_server.py` daemon on `127.0.0.1:18080` next to the `ExecutionWorker` Ray actor, which `ray_actor_options` in `sandbox_fusion_tool_config_tpu.yaml` pins to the CPU head node):
 
 ```bash
 bash examples/tpu/retool/run_qwen3_30b_a3b_dapo_torchtitan.sh
