@@ -16,6 +16,7 @@ The concrete Engine implementation using PyTorch TorchTitan parallelism (FSDP2 +
 """
 
 import importlib
+import json
 import logging
 import math
 import os
@@ -25,6 +26,7 @@ from typing import Any, Callable, Optional
 
 import torch
 import torch.distributed
+from safetensors.torch import save_file as save_safetensors_file
 from tensordict import TensorDict
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.experimental._context_parallel._load_balancer import _HeadTailLoadBalancer
@@ -177,11 +179,15 @@ class TorchTitanEngine(BaseEngine):
             expert_parallel_degree=self.engine_config.expert_parallel_size,
             spmd_backend=self.engine_config.spmd_backend,
         )
+        async_save = not self.engine_config.forward_only and bool(
+            getattr(self.checkpoint_config, "async_save", False)
+        )
         checkpoint = CheckpointManager.Config(
             enable=True,
             initial_load_in_hf=True,
             initial_load_model_only=True,
             initial_load_path=model_config.path,
+            async_mode="async" if async_save else "disabled",
         )
         compile_config = CompileConfig(enable=self.engine_config.use_torch_compile)
         training_kwargs = {}
@@ -523,19 +529,101 @@ class TorchTitanEngine(BaseEngine):
             for module in self.module:
                 load_fsdp_model_to_gpu(module)
 
-        # Override TorchTitan's folder to use verl's path
-        parent_dir = os.path.dirname(local_path)
-        self.checkpointer.folder = parent_dir
+        save_contents = (
+            list(self.checkpoint_config.save_contents)
+            if self.checkpoint_config is not None and self.checkpoint_config.save_contents is not None
+            else ["model", "optimizer", "extra"]
+        )
 
-        if max_ckpt_to_keep is not None:
-            self.checkpointer.keep_latest_k = max_ckpt_to_keep
+        if any(k in save_contents for k in ("model", "optimizer")):
+            # Override TorchTitan's folder to use verl's path
+            parent_dir = os.path.dirname(local_path)
+            self.checkpointer.folder = parent_dir
 
-        self.checkpointer.save(curr_step=global_step)
+            if max_ckpt_to_keep is not None:
+                self.checkpointer.keep_latest_k = max_ckpt_to_keep
+
+            self.checkpointer.save(curr_step=global_step)
+            save_future = getattr(self.checkpointer, "save_future", None)
+            if save_future is not None and (
+                not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            ):
+                ckpt_root = (
+                    parent_dir
+                    if os.path.basename(local_path).startswith("global_step_")
+                    else os.path.dirname(parent_dir)
+                )
+                tracker_file = os.path.join(ckpt_root, "latest_checkpointed_iteration.txt")
+
+                def _write_tracker(fut):
+                    if fut.exception() is None:
+                        with open(tracker_file, "w", encoding="utf-8") as f:
+                            f.write(str(global_step))
+
+                save_future.add_done_callback(_write_tracker)
+
+        if "hf_model" in save_contents:
+            self._save_hf_checkpoint(local_path)
 
         torch.distributed.barrier()
         if self._is_offload_param:
             for module in self.module:
                 offload_fsdp_model_to_cpu(module)
+
+    def _save_hf_checkpoint(self, local_path: str, max_shard_bytes: int = 5 * 1024**3) -> None:
+        """Stream HuggingFace safetensors + config/tokenizer into ``<local_path>/huggingface`` on rank 0."""
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        hf_local_path = os.path.join(local_path, "huggingface")
+        hf_config = getattr(self.model_config, "hf_config", None)
+        tie_word_embeddings = bool(getattr(hf_config, "tie_word_embeddings", False))
+
+        if rank == 0:
+            os.makedirs(hf_local_path, exist_ok=True)
+            if hf_config is not None:
+                hf_config.save_pretrained(hf_local_path)
+            tokenizer = getattr(self.model_config, "tokenizer", None)
+            if tokenizer is not None:
+                tokenizer.save_pretrained(hf_local_path)
+
+        per_tensor_param, _ = self.get_per_tensor_param()
+        shard: dict[str, torch.Tensor] = {}
+        shard_bytes, total_size = 0, 0
+        tmp_shards: list[tuple[str, list[str]]] = []
+
+        def _flush_shard() -> None:
+            nonlocal shard, shard_bytes
+            tmp_path = os.path.join(hf_local_path, f"model-{len(tmp_shards) + 1:05d}.safetensors.tmp")
+            save_safetensors_file(shard, tmp_path, metadata={"format": "pt"})
+            tmp_shards.append((tmp_path, list(shard)))
+            shard, shard_bytes = {}, 0
+
+        for name, tensor in per_tensor_param:
+            if rank != 0 or (tie_word_embeddings and name == "lm_head.weight"):
+                continue
+            nbytes = tensor.numel() * tensor.element_size()
+            if shard and shard_bytes + nbytes > max_shard_bytes:
+                _flush_shard()
+            shard[name] = tensor.detach().cpu().contiguous()
+            shard_bytes += nbytes
+            total_size += nbytes
+
+        if rank != 0:
+            return
+        if shard:
+            _flush_shard()
+
+        weight_map: dict[str, str] = {}
+        for i, (tmp_path, names) in enumerate(tmp_shards, start=1):
+            file_name = (
+                "model.safetensors"
+                if len(tmp_shards) == 1
+                else f"model-{i:05d}-of-{len(tmp_shards):05d}.safetensors"
+            )
+            os.replace(tmp_path, os.path.join(hf_local_path, file_name))
+            weight_map.update(dict.fromkeys(names, file_name))
+        if len(tmp_shards) > 1:
+            with open(os.path.join(hf_local_path, "model.safetensors.index.json"), "w", encoding="utf-8") as f:
+                json.dump({"metadata": {"total_size": total_size}, "weight_map": weight_map}, f, indent=2)
 
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
