@@ -22,6 +22,8 @@ import math
 import os
 import re
 import shutil
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from typing import Any, Callable, Optional
 
@@ -181,11 +183,18 @@ class TorchTitanEngine(BaseEngine):
             expert_parallel_degree=self.engine_config.expert_parallel_size,
             spmd_backend=self.engine_config.spmd_backend,
         )
+        self._async_save = not self.engine_config.forward_only and (
+            bool(getattr(self.checkpoint_config, "async_save", False))
+            or os.environ.get("VERL_TORCHTITAN_ASYNC_CHECKPOINT", "0") == "1"
+        )
+        self._hf_save_executor: Optional[ThreadPoolExecutor] = None
+        self._hf_save_future: Optional[Future] = None
         checkpoint = CheckpointManager.Config(
             enable=True,
             initial_load_in_hf=True,
             initial_load_model_only=True,
             initial_load_path=model_config.path,
+            async_mode="async" if self._async_save else "disabled",
         )
         compile_config = CompileConfig(enable=self.engine_config.use_torch_compile)
         training_kwargs = {}
@@ -514,6 +523,72 @@ class TorchTitanEngine(BaseEngine):
         else:
             raise ValueError(f"Invalid device type: {device}")
 
+    def _drop_checkpoint_state_dict_cache(self) -> None:
+        """Release cached model state dict entries held by TorchTitan's ModelWrapper."""
+        checkpointer = getattr(self, "checkpointer", None)
+        states = getattr(checkpointer, "states", None)
+        if not isinstance(states, dict):
+            return
+        for wrapper in states.values():
+            if hasattr(wrapper, "cached_state_dict"):
+                wrapper.cached_state_dict = None
+
+    def _wait_async_hf_save(self) -> None:
+        """Wait for any in-flight asynchronous HuggingFace safetensors export to complete."""
+        future = getattr(self, "_hf_save_future", None)
+        if future is not None:
+            self._hf_save_future = None
+            future.result()
+        tracker_wait = getattr(self, "_async_tracker_wait", None)
+        if tracker_wait is not None:
+            tracker_wait()
+
+    def _schedule_async_tracker_update(
+        self, local_path: str, global_step: int, pending_futures: list[Future]
+    ) -> None:
+        """Write ``latest_checkpointed_iteration.txt`` on rank 0 once all async checkpoint futures finish."""
+        if not pending_futures:
+            return
+        ckpt_root_dir = (
+            os.path.dirname(local_path)
+            if os.path.basename(local_path).startswith("global_step_")
+            else os.path.dirname(os.path.dirname(local_path))
+        )
+        if not ckpt_root_dir:
+            return
+        tracker_file = os.path.join(ckpt_root_dir, "latest_checkpointed_iteration.txt")
+        lock = threading.Lock()
+        remaining = [len(pending_futures)]
+        tracker_event = threading.Event()
+        self._async_tracker_wait = lambda: tracker_event.wait() if all(f.done() for f in pending_futures) else None
+
+        def _on_done(_fut: Future) -> None:
+            with lock:
+                remaining[0] -= 1
+                if remaining[0] > 0:
+                    return
+            try:
+                for fut in pending_futures:
+                    exc = fut.exception()
+                    if exc is not None:
+                        logger.warning(
+                            "Async checkpoint save failed at step %d: %s",
+                            global_step,
+                            exc,
+                        )
+                        return
+                try:
+                    os.makedirs(ckpt_root_dir, exist_ok=True)
+                    with open(tracker_file, "w", encoding="utf-8") as f:
+                        f.write(str(global_step))
+                except OSError as err:
+                    logger.warning("Failed to update %s: %s", tracker_file, err)
+            finally:
+                tracker_event.set()
+
+        for fut in pending_futures:
+            fut.add_done_callback(_on_done)
+
     def save_checkpoint(
         self,
         local_path: str,
@@ -532,6 +607,7 @@ class TorchTitanEngine(BaseEngine):
             if self.checkpoint_config is not None and self.checkpoint_config.save_contents is not None
             else ["model", "optimizer", "extra"]
         )
+        pending_futures: list[Future] = []
 
         if any(k in save_contents for k in ("model", "optimizer")):
             # Override TorchTitan's folder to use verl's path
@@ -542,9 +618,21 @@ class TorchTitanEngine(BaseEngine):
                 self.checkpointer.keep_latest_k = max_ckpt_to_keep
 
             self.checkpointer.save(curr_step=global_step)
+            self._drop_checkpoint_state_dict_cache()
+            dcp_future = getattr(self.checkpointer, "save_future", None)
+            if dcp_future is not None:
+                pending_futures.append(dcp_future)
 
         if "hf_model" in save_contents:
             self._save_hf_checkpoint(local_path)
+            hf_future = getattr(self, "_hf_save_future", None)
+            if hf_future is not None:
+                pending_futures.append(hf_future)
+
+        if getattr(self, "_async_save", False) and (
+            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        ):
+            self._schedule_async_tracker_update(local_path, global_step, pending_futures)
 
         torch.distributed.barrier()
         if self._is_offload_param:
@@ -556,8 +644,12 @@ class TorchTitanEngine(BaseEngine):
 
         Gathers 3D MoE expert stacks in bulk (e.g. 144 stacks on Qwen3-30B-A3B instead of 18,432 per-expert syncs),
         restricts CPU materialization to one writer per host, and flushes each completed safetensors shard
-        immediately so peak host RAM stays bounded to ~1 shard rather than the full model.
+        immediately (either synchronously or via a background FIFO thread when ``async_save=True``) so peak host RAM
+        stays bounded to ~1 shard rather than the full model.
         """
+        self._wait_async_hf_save()
+        async_save = bool(getattr(self, "_async_save", False))
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         ray_local_ws = int(os.environ.get("RAY_LOCAL_WORLD_SIZE", "0"))
         tpu_visible_chip = os.environ.get("TPU_VISIBLE_CHIPS", "")
@@ -597,23 +689,10 @@ class TorchTitanEngine(BaseEngine):
 
         if should_write:
             os.makedirs(hf_local_path, exist_ok=True)
-            if src_dir and os.path.isdir(src_dir):
-                for fname in os.listdir(src_dir):
-                    src_file = os.path.join(src_dir, fname)
-                    if not os.path.isfile(src_file):
-                        continue
-                    if fname.endswith((".safetensors", ".bin", ".pt", ".pth", ".ckpt")) or fname in (
-                        "model.safetensors.index.json",
-                        "pytorch_model.bin.index.json",
-                    ):
-                        continue
-                    shutil.copy2(src_file, os.path.join(hf_local_path, fname))
-
-            if hf_config is not None and not os.path.isfile(os.path.join(hf_local_path, "config.json")):
-                hf_config.save_pretrained(hf_local_path)
-            tokenizer = getattr(self.model_config, "tokenizer", None)
-            if tokenizer is not None and not os.path.isfile(os.path.join(hf_local_path, "tokenizer_config.json")):
-                tokenizer.save_pretrained(hf_local_path)
+            if async_save and getattr(self, "_hf_save_executor", None) is None:
+                self._hf_save_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="torchtitan-hf-ckpt"
+                )
 
             index_file = os.path.join(src_dir, "model.safetensors.index.json") if src_dir else ""
             if index_file and os.path.isfile(index_file):
@@ -626,6 +705,20 @@ class TorchTitanEngine(BaseEngine):
                     new_weight_map[k] = shard_name
                     remaining_in_shard[shard_name] = remaining_in_shard.get(shard_name, 0) + 1
 
+        def _write_shard_file(shard_name: str, shard_tensors: dict[str, torch.Tensor]) -> None:
+            save_safetensors_file(
+                shard_tensors,
+                os.path.join(hf_local_path, shard_name),
+                metadata={"format": "pt"},
+            )
+            shard_tensors.clear()
+
+        def _flush_shard(shard_name: str, shard_tensors: dict[str, torch.Tensor]) -> None:
+            if async_save and self._hf_save_executor is not None:
+                self._hf_save_executor.submit(_write_shard_file, shard_name, shard_tensors)
+            else:
+                _write_shard_file(shard_name, shard_tensors)
+
         def _record_cpu_tensor(hf_name: str, cpu_tensor: torch.Tensor) -> None:
             if hf_name not in all_hf_keys:
                 return
@@ -634,11 +727,7 @@ class TorchTitanEngine(BaseEngine):
                 pending_shards.setdefault(shard_name, {})[hf_name] = cpu_tensor
                 remaining_in_shard[shard_name] -= 1
                 if remaining_in_shard[shard_name] == 0:
-                    save_safetensors_file(
-                        pending_shards.pop(shard_name),
-                        os.path.join(hf_local_path, shard_name),
-                        metadata={"format": "pt"},
-                    )
+                    _flush_shard(shard_name, pending_shards.pop(shard_name))
             else:
                 single_state_dict[hf_name] = cpu_tensor
 
@@ -674,31 +763,56 @@ class TorchTitanEngine(BaseEngine):
         expert_stacks.clear()
 
         if should_write:
-            if index_data is not None:
-                for shard_name, shard_tensors in list(pending_shards.items()):
-                    save_safetensors_file(
-                        shard_tensors,
-                        os.path.join(hf_local_path, shard_name),
-                        metadata={"format": "pt"},
-                    )
-                pending_shards.clear()
-                index_data["weight_map"] = new_weight_map
-                with open(os.path.join(hf_local_path, "model.safetensors.index.json"), "w", encoding="utf-8") as f:
-                    json.dump(index_data, f, indent=2)
-            else:
-                save_safetensors_file(
-                    single_state_dict,
-                    os.path.join(hf_local_path, "model.safetensors"),
-                    metadata={"format": "pt"},
-                )
-                single_state_dict.clear()
+            tokenizer = getattr(self.model_config, "tokenizer", None)
+            remaining_shards = list(pending_shards.items())
+            pending_shards.clear()
+            final_single_sd = dict(single_state_dict)
+            single_state_dict.clear()
 
-            logger.warning("Saved HuggingFace checkpoint to %s", hf_local_path)
+            def _finalize_hf_export() -> None:
+                if src_dir and os.path.isdir(src_dir):
+                    for fname in os.listdir(src_dir):
+                        src_file = os.path.join(src_dir, fname)
+                        if not os.path.isfile(src_file):
+                            continue
+                        if fname.endswith((".safetensors", ".bin", ".pt", ".pth", ".ckpt")) or fname in (
+                            "model.safetensors.index.json",
+                            "pytorch_model.bin.index.json",
+                        ):
+                            continue
+                        shutil.copy2(src_file, os.path.join(hf_local_path, fname))
+
+                if hf_config is not None and not os.path.isfile(os.path.join(hf_local_path, "config.json")):
+                    hf_config.save_pretrained(hf_local_path)
+                if tokenizer is not None and not os.path.isfile(
+                    os.path.join(hf_local_path, "tokenizer_config.json")
+                ):
+                    tokenizer.save_pretrained(hf_local_path)
+
+                if index_data is not None:
+                    for shard_name, shard_tensors in remaining_shards:
+                        _write_shard_file(shard_name, shard_tensors)
+                    remaining_shards.clear()
+                    index_data["weight_map"] = new_weight_map
+                    with open(
+                        os.path.join(hf_local_path, "model.safetensors.index.json"), "w", encoding="utf-8"
+                    ) as f:
+                        json.dump(index_data, f, indent=2)
+                else:
+                    _write_shard_file("model.safetensors", final_single_sd)
+
+                logger.warning("Saved HuggingFace checkpoint to %s", hf_local_path)
+
+            if async_save and self._hf_save_executor is not None:
+                self._hf_save_future = self._hf_save_executor.submit(_finalize_hf_export)
+            else:
+                _finalize_hf_export()
 
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
     ) -> None:
         """Load checkpoint."""
+        self._wait_async_hf_save()
         if self._is_offload_param:
             for module in self.module:
                 load_fsdp_model_to_gpu(module)
