@@ -234,9 +234,12 @@ class DeepSWESeparateAsyncPPOTrainer(_DeepSWESandboxLookaheadMixin, PPOTrainerSe
     """Separate-async PPO trainer with 2-slot K8s sandbox lookahead pre-warming for DeepSWE."""
 
     def _should_refill_after_sample(self) -> bool:
-        return not self.hybrid_rollout_config.enable_switch and os.getenv(
-            "VERL_REFILL_AFTER_SAMPLE", "0"
-        ).strip().lower() in ("1", "true", "yes")
+        num_warmup = self.config.trainer.v1.separate_async.get("num_warmup_batches", 0) or 0
+        return (
+            num_warmup > 0
+            and not self.hybrid_rollout_config.enable_switch
+            and os.getenv("VERL_REFILL_AFTER_SAMPLE", "0").strip().lower() in ("1", "true", "yes")
+        )
 
     def on_train_begin(self) -> None:
         self._prime_sandbox_lookahead()
