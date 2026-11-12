@@ -60,7 +60,14 @@ AGENT_LOG_DIR="${AGENT_LOG_DIR:-/tmp/uni_agent_logs/${EXPERIMENT_NAME}}"
 MASK_UNFINISHED_EPISODE="${MASK_UNFINISHED_EPISODE:-False}"
 
 VERL_EXT_MODULES="verl_hardware_plugin,examples.tpu.deepswe.deepswe"
+# vLLM 0.32 enables async scheduling by default. With tpu-sync's in-flight weight updates (abort + pause + resume),
+# the scheduler and model runner can desync and gpu_model_runner._update_states raises
+# KeyError(req_data.all_token_ids[req_id]) -> EngineDeadError. That line only runs with async scheduling, so it is
+# off by default here (Run 16: 78 steps / 6 h without the crash, trainer timings unchanged).
+VLLM_ASYNC_SCHEDULING="${VLLM_ASYNC_SCHEDULING:-False}"
+
 AGENT_OVERRIDES=(
+  "++actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=${VLLM_ASYNC_SCHEDULING}"
   "+ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES='${VERL_EXT_MODULES}'"
   "+ray_kwargs.ray_init.runtime_env.env_vars.VERL_REFILL_AFTER_SAMPLE='${VERL_REFILL_AFTER_SAMPLE}'"
   "+ray_kwargs.ray_init.runtime_env.env_vars.VERL_SANDBOX_LOOKAHEAD='${VERL_SANDBOX_LOOKAHEAD}'"

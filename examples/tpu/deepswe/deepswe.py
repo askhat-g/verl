@@ -19,15 +19,15 @@ This module lives inside the DeepSWE recipe folder (``examples/tpu/deepswe/deeps
 
 from __future__ import annotations
 
-from collections import defaultdict
 import logging
 import os
 import uuid
+from collections import defaultdict
 from typing import Any
 
 import numpy as np
-from tensordict import TensorDict
 import torch
+from tensordict import TensorDict
 
 from verl.trainer.ppo.core_algos import ADV_ESTIMATOR_REGISTRY, register_adv_est
 from verl.trainer.ppo.v1.trainer_base import TRAINER_REGISTRY, PPOTrainer
@@ -191,10 +191,7 @@ class _DeepSWESandboxLookaheadMixin:
             wait_eval_sandbox_images_ready()
 
     def _finish_sampled_sandbox_batch(self: PPOTrainer) -> None:
-        if (
-            self._prewarm_batch_iterator is not None
-            and self.local_trigger_step == self.parameter_sync_step - 1
-        ):
+        if self._prewarm_batch_iterator is not None and self.local_trigger_step == self.parameter_sync_step - 1:
             self._prewarm_batch_iterator.finish_oldest_inflight_batch(wait=False)
 
     def _close_sandbox_lookahead(self: PPOTrainer) -> None:
@@ -230,6 +227,12 @@ class _DeepSWESandboxLookaheadMixin:
         return batch
 
 
+# If the core separate-async trainer already implements refill-after-sample (it defines
+# ``_should_refill_after_sample`` and refills in ``on_sample_end``), defer to it; otherwise this recipe refills
+# itself. Doing both would submit two batches per step.
+_CORE_HAS_REFILL_AFTER_SAMPLE = hasattr(PPOTrainerSeparateAsync, "_should_refill_after_sample")
+
+
 class DeepSWESeparateAsyncPPOTrainer(_DeepSWESandboxLookaheadMixin, PPOTrainerSeparateAsync):
     """Separate-async PPO trainer with 2-slot K8s sandbox lookahead pre-warming for DeepSWE."""
 
@@ -237,6 +240,9 @@ class DeepSWESeparateAsyncPPOTrainer(_DeepSWESandboxLookaheadMixin, PPOTrainerSe
         return not self.hybrid_rollout_config.enable_switch and os.getenv(
             "VERL_REFILL_AFTER_SAMPLE", "0"
         ).strip().lower() in ("1", "true", "yes")
+
+    def _recipe_refills(self) -> bool:
+        return not _CORE_HAS_REFILL_AFTER_SAMPLE and self._should_refill_after_sample()
 
     def on_train_begin(self) -> None:
         self._prime_sandbox_lookahead()
@@ -256,14 +262,14 @@ class DeepSWESeparateAsyncPPOTrainer(_DeepSWESandboxLookaheadMixin, PPOTrainerSe
         self._finish_sampled_sandbox_batch()
         super().on_sample_end()
         if (
-            self._should_refill_after_sample()
+            self._recipe_refills()
             and self.local_trigger_step == self.parameter_sync_step - 1
             and self.global_steps < self.total_training_steps
         ):
             self._add_batch_to_generate()
 
     def prepare_step(self) -> dict:
-        if self._should_refill_after_sample():
+        if self._recipe_refills():
             return self._wait_for_sampleable_and_switch()
         return super().prepare_step()
 
