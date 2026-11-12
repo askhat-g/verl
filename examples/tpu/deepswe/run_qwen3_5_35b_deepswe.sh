@@ -98,12 +98,16 @@ if [[ "${TPU_ACCELERATOR_TYPE:-tpu7x}" == "v5p" ]]; then
   )
 fi
 
+export ADV_ESTIMATOR="${ADV_ESTIMATOR:-grpo_loo}"
+
 exec bash "${SCRIPT_DIR}/../grpo/run_qwen3_5_torchtitan.sh" \
-    algorithm.adv_estimator=rloo \
+    algorithm.adv_estimator="${ADV_ESTIMATOR}" \
     algorithm.use_kl_in_reward=False \
+    algorithm.rollout_correction.bypass_mode=False \
     algorithm.rollout_correction.rollout_is=null \
     algorithm.rollout_correction.rollout_rs=seq_mean_k1 \
     "algorithm.rollout_correction.rollout_rs_threshold='0.999_1.002'" \
+    actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
