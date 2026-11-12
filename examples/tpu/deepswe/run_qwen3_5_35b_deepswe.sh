@@ -119,7 +119,9 @@ exec bash "${SCRIPT_DIR}/../grpo/run_qwen3_5_torchtitan.sh" \
     "actor_rollout_ref.actor.optim.betas=[0.9,0.999]" \
     actor_rollout_ref.actor.optim.min_lr_factor=1.0 \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_DEVICE}" \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE:-1}" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_DEVICE}" \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE:-1}" \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_DEVICE}" \
     ++data.max_length="${MAX_MODEL_LEN}" \
     ++data.max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_DEVICE}" \
