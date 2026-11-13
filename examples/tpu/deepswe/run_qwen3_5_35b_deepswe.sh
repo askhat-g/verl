@@ -98,15 +98,28 @@ if [[ "${TPU_ACCELERATOR_TYPE:-tpu7x}" == "v5p" ]]; then
   )
 fi
 
-export ADV_ESTIMATOR="${ADV_ESTIMATOR:-grpo_loo}"
+# Advantage and rollout-correction defaults follow the settings of the reference run that learned fastest on the
+# MLPerf R2E-Gym-Easy 700/70 split (google-trellis/verl-tpu-deepswe run q35b_deepswe_v7x_mlperf700_16_lookahead_val_6r):
+#   - rloo: leave-one-out baseline, r_i - mean(r_-i), without dividing by the group std. Set ADV_ESTIMATOR=grpo_loo for
+#     the std-scaled variant registered in deepswe.py.
+#   - rollout_is=seq_mask_tis: per-token truncated IS weights; a sequence whose geometric-mean pi_train / pi_rollout
+#     ratio leaves the ROLLOUT_IS_THRESHOLD band gets zero weight but stays in the loss denominator.
+#   - rollout_rs=seq_mean_abs_exp: drop a sequence when mean_t exp(|log pi_train - log pi_rollout|) exceeds
+#     ROLLOUT_RS_THRESHOLD.
+export ADV_ESTIMATOR="${ADV_ESTIMATOR:-rloo}"
+ROLLOUT_IS="${ROLLOUT_IS:-seq_mask_tis}"
+ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-0.998_1.002}"
+ROLLOUT_RS="${ROLLOUT_RS:-seq_mean_abs_exp}"
+ROLLOUT_RS_THRESHOLD="${ROLLOUT_RS_THRESHOLD:-2.0}"
 
 exec bash "${SCRIPT_DIR}/../grpo/run_qwen3_5_torchtitan.sh" \
     algorithm.adv_estimator="${ADV_ESTIMATOR}" \
     algorithm.use_kl_in_reward=False \
     algorithm.rollout_correction.bypass_mode=False \
-    algorithm.rollout_correction.rollout_is=null \
-    algorithm.rollout_correction.rollout_rs=seq_mean_k1 \
-    "algorithm.rollout_correction.rollout_rs_threshold='0.999_1.002'" \
+    algorithm.rollout_correction.rollout_is="${ROLLOUT_IS}" \
+    "algorithm.rollout_correction.rollout_is_threshold='${ROLLOUT_IS_THRESHOLD}'" \
+    algorithm.rollout_correction.rollout_rs="${ROLLOUT_RS}" \
+    "algorithm.rollout_correction.rollout_rs_threshold='${ROLLOUT_RS_THRESHOLD}'" \
     actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
