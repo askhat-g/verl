@@ -227,10 +227,13 @@ class _DeepSWESandboxLookaheadMixin:
         return batch
 
 
-# If the core separate-async trainer already implements refill-after-sample (it defines
-# ``_should_refill_after_sample`` and refills in ``on_sample_end``), defer to it; otherwise this recipe refills
-# itself. Doing both would submit two batches per step.
-_CORE_HAS_REFILL_AFTER_SAMPLE = hasattr(PPOTrainerSeparateAsync, "_should_refill_after_sample")
+# If the core separate-async trainer already implements refill-after-sample, defer to it; otherwise this recipe
+# refills itself. Doing both would submit two batches per step. Two core variants exist: the env-var one
+# (``_should_refill_after_sample``, ``VERL_REFILL_AFTER_SAMPLE=1``) and the config one from verl-project/verl#8661
+# (``_refill_after_sample``, ``trainer.v1.separate_async.refill_after_sample=True``).
+_CORE_HAS_REFILL_AFTER_SAMPLE = hasattr(PPOTrainerSeparateAsync, "_should_refill_after_sample") or hasattr(
+    PPOTrainerSeparateAsync, "_refill_after_sample"
+)
 
 
 class DeepSWESeparateAsyncPPOTrainer(_DeepSWESandboxLookaheadMixin, PPOTrainerSeparateAsync):
